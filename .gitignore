@@ -2,14 +2,24 @@ venv/
 __pycache__/
 *.pyc
 
+
+# Secrets
 .env
 *.env
 *.json
 
-
+# Artifacts and Runtime/protype folder
 data/
-
 /email_finder_prototype
 
+# Personal reference
 commands.txt
 Improvements.txt
+ToDO.txt
+
+# Python build artifacts
+*.egg-info/
+dist/
+build/
+__pycache__/
+*.pyc
