@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+
+.env
+*.env
+*.json
+
+
+data/
+
+/email_finder_prototype
+
+commands.txt
+Improvements.txt
