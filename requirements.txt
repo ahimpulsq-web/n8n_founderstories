@@ -22,6 +22,7 @@ lxml
 email-validator
 tldextract
 httpx[http2]
+scrapy
 
 openai
 google-genai

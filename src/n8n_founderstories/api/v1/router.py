@@ -21,9 +21,10 @@ router = APIRouter()
 
 router.include_router(prompt_router, tags=["prompt"])
 router.include_router(jobs_router, tags=["jobs"])
-router.include_router(master_router, tags=["master"])
-router.include_router(email_extractor_router, tags=["web_scrapper"])
+
 
 router.include_router(google_maps_router, tags=["location"])
 router.include_router(hunter_router, tags=["enrichment"])
 router.include_router(google_search_router, tags=["google_search"])
+router.include_router(master_router, tags=["master"])
+router.include_router(email_extractor_router, tags=["web_scrapper"])

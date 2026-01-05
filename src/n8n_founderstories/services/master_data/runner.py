@@ -1,5 +1,11 @@
 # =============================================================================
-# C:\Projects\N8N-FounderStories\src\n8n_founderstories\services\master_data\runner.py
+# runner.py (Master ingestion) — UPDATED FOR SHEETS MANAGER (BUFFERED WRITES)
+#
+# Changes vs your current version:
+# - Uses GoogleSheetsManager for buffered writes (append + headers + structural ops batching).
+# - Removes any private SheetsClient usage (no _get_sheet_id_by_title).
+# - Uses SheetsClient.get_sheet_id() for conditional formatting.
+# - Keeps your TEST MODE restart behavior intact.
 # =============================================================================
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ..exports.sheets import SheetsClient, default_sheets_config
+from ..exports.sheets_manager import GoogleSheetsManager  # <-- NEW
 from ..jobs.logging import job_logger
 from ..jobs.sheets_status import ToolStatusWriter
 from ..jobs.store import mark_failed, mark_running, mark_succeeded, update_progress
@@ -21,15 +28,21 @@ logger = logging.getLogger(__name__)
 TAB_MASTER = "Master"
 TAB_MASTER_STATE = "Master_State"
 
-MASTER_HEADERS = [
-    "Company",
-    "Domain",
-    "Website",
-    "Source",
-    "Location",
-    "Query Source",
-    "Repeated",
+# ---------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH: schema keys + header labels
+# ---------------------------------------------------------------------------
+MASTER_SCHEMA: list[tuple[str, str]] = [
+    ("company", "Company Name"),
+    ("domain", "Primary Domain"),
+    ("website", "Website URL"),
+    ("source_tool", "Source Tool"),
+    ("location", "Location"),
+    ("lead_query", "Lead Source Query"),
+    ("dup_in_run", "Duplicate (This Run)"),
 ]
+
+MASTER_KEYS = [k for (k, _label) in MASTER_SCHEMA]
+MASTER_HEADERS = [label for (_k, label) in MASTER_SCHEMA]
 
 STATE_HEADERS = [
     "Source Tab",
@@ -67,7 +80,12 @@ DEFAULT_COLUMN_MAP: dict[str, dict[str, int]] = {
     },
 }
 
-# How often to write RUNNING status messages (per pass).
+DEFAULT_TEST_CAPS: dict[str, int] = {
+    "HunterIO": 10,
+    "GoogleMaps": 5,
+    "GoogleSearch": 5,
+}
+
 STATUS_EVERY_N_PASSES = 1
 
 
@@ -102,8 +120,19 @@ def _block_effective_rows(block: list[list[str]]) -> int:
     return n
 
 
-def _load_watermarks(sheets: SheetsClient) -> dict[str, int]:
-    rows = sheets.read_range(tab_name=TAB_MASTER_STATE, a1_range="A2:B")
+def _col_index_to_a1(col_index: int) -> str:
+    if col_index < 0:
+        raise ValueError("col_index must be >= 0")
+    n = col_index + 1
+    letters: list[str] = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(ord("A") + rem))
+    return "".join(reversed(letters))
+
+
+def _load_watermarks(sheets_mgr: GoogleSheetsManager) -> dict[str, int]:
+    rows = sheets_mgr.read_range(tab_name=TAB_MASTER_STATE, a1_range="A2:B")
     out: dict[str, int] = {}
     for r in rows:
         if not r:
@@ -120,6 +149,8 @@ def _load_watermarks(sheets: SheetsClient) -> dict[str, int]:
 
 
 def _write_watermark(sheets: SheetsClient, *, source_tab: str, last_row: int) -> None:
+    # NOTE: This still does a bounded scan. That is acceptable in production
+    # because it runs once per "window" processed, not per row.
     sheets.upsert_row_by_key(
         tab_name=TAB_MASTER_STATE,
         key=source_tab,
@@ -173,17 +204,21 @@ def run_master_job(
     hide_state_tab: bool = True,
     hide_audit_tabs: bool = True,
     reorder_tabs: bool = True,
-    # NEW: linger mode so Master can start before upstream tools finish
     linger_seconds: float = 3.0,
     max_empty_passes: int = 10,
-    # NEW: bounded reads (keeps reads light; no last-row scan)
     window_rows: int = 500,
-    max_total_appends: int = 5000,  # safety cap for one run
+    max_total_appends: int = 5000,
+    # TEST MODE / CAPS
+    test_mode: bool = True,
+    reset_master_in_test_mode: bool = True,
+    max_rows_per_source: dict[str, int] | None = None,
+    max_passes: int | None = None,
 ) -> None:
     rid = (getattr(plan, "request_id", None) or "").strip()
     log = job_logger(__name__, tool="master", request_id=rid, job_id=job_id)
 
     sheets: SheetsClient | None = None
+    sheets_mgr: GoogleSheetsManager | None = None
     status: ToolStatusWriter | None = None
 
     domain_col_map_eff = domain_col_map or DEFAULT_DOMAIN_COL_MAP
@@ -197,21 +232,38 @@ def run_master_job(
             raise ValueError("spreadsheet_id must not be empty.")
 
         sheets = SheetsClient(config=default_sheets_config(spreadsheet_id=sid))
+        sheets_mgr = GoogleSheetsManager(client=sheets)
         status = ToolStatusWriter(sheets=sheets, spreadsheet_id=sid)
 
-        # Ensure tabs exist + headers
-        sheets.ensure_tab_with_header(TAB_MASTER, MASTER_HEADERS)
-        sheets.ensure_tab_with_header(TAB_MASTER_STATE, STATE_HEADERS)
+        # ---------------------------------------------------------------------
+        # Tabs + headers (test reset uses structural delete)
+        # ---------------------------------------------------------------------
+        if test_mode and reset_master_in_test_mode:
+            try:
+                sheets.delete_tab(tab_name=TAB_MASTER)
+            except Exception:
+                logger.exception("MASTER_TEST_RESET_DELETE_FAILED")
+
+        # Use manager setup for owned tabs: less read quota, more batching
+        # (We intentionally keep overwrite_headers_for_owned_tabs=True to avoid header reads.)
+        sheets_mgr.setup_tabs(
+            headers=[
+                (TAB_MASTER, MASTER_HEADERS),
+                (TAB_MASTER_STATE, STATE_HEADERS),
+            ],
+            hide_tabs=[TAB_MASTER_STATE] if hide_state_tab else [],
+            tab_order=[],
+            overwrite_headers_for_owned_tabs=True,
+            # Use a lightweight init marker to prevent repeated setup churn
+            # (In test mode, Master tab may be deleted each run; marker is still safe.)
+            init_marker_tab="Tool_Status" if not test_mode else "Master_State",
+            init_marker_cell="A1",
+        )
+
         status.ensure_ready()
 
-        if hide_state_tab:
-            try:
-                sheets.hide_tab(tab_name=TAB_MASTER_STATE)
-            except Exception:
-                logger.exception("MASTER_HIDE_STATE_TAB_FAILED")
-
-        # Best-effort tab layout controls (kept)
-        if sheets and reorder_tabs:
+        # Optional: reorder/hide (kept from your logic)
+        if reorder_tabs:
             try:
                 order = ["Tool_Status", "HunterIO", "GoogleMaps", "GoogleSearch", TAB_MASTER]
                 for idx, name in enumerate(order):
@@ -226,23 +278,42 @@ def run_master_job(
             except Exception:
                 logger.exception("MASTER_TAB_REORDER_FAILED")
 
-        # Load watermarks once; update in-memory per pass
-        watermarks = _load_watermarks(sheets)
-
         cleaned_sources = [t.strip() for t in (source_tabs or []) if (t or "").strip()]
         total_sources = len(cleaned_sources)
+
+        # Root-cause fix for "same N each run":
+        if test_mode and max_rows_per_source is None:
+            max_rows_per_source = dict(DEFAULT_TEST_CAPS)
+
+        if test_mode:
+            watermarks = {t: 1 for t in cleaned_sources}
+        else:
+            watermarks = _load_watermarks(sheets_mgr)
+
+        linger_s = 0.0 if test_mode else max(0.0, float(linger_seconds))
+        empty_cap = 1 if test_mode else max(0, int(max_empty_passes))
+
+        win = max(10, int(window_rows))
+        max_append_cap = max(1, int(max_total_appends))
+        caps_raw = {k.strip(): int(v) for (k, v) in (max_rows_per_source or {}).items() if (k or "").strip()}
+        caps = {t: caps_raw[t] for t in cleaned_sources if t in caps_raw}
 
         update_progress(
             job_id,
             phase="master",
             current=0,
             total=total_sources,
-            message="Starting Master ingestion (linger mode).",
+            message="Starting Master ingestion.",
             metrics={
                 "sources": total_sources,
-                "linger_seconds": float(linger_seconds),
-                "max_empty_passes": int(max_empty_passes),
-                "window_rows": int(window_rows),
+                "test_mode": bool(test_mode),
+                "reset_master_in_test_mode": bool(reset_master_in_test_mode),
+                "linger_seconds": float(linger_s),
+                "max_empty_passes": int(empty_cap),
+                "window_rows": int(win),
+                "max_total_appends": int(max_append_cap),
+                "max_rows_per_source": caps,
+                "master_cols": len(MASTER_KEYS),
             },
         )
 
@@ -254,12 +325,17 @@ def run_master_job(
             phase="master",
             current=0,
             total=total_sources,
-            message="Starting Master ingestion (linger mode).",
+            message="Starting Master ingestion.",
             meta={
                 "sources": total_sources,
-                "linger_seconds": float(linger_seconds),
-                "max_empty_passes": int(max_empty_passes),
-                "window_rows": int(window_rows),
+                "test_mode": bool(test_mode),
+                "reset_master_in_test_mode": bool(reset_master_in_test_mode),
+                "linger_seconds": float(linger_s),
+                "max_empty_passes": int(empty_cap),
+                "window_rows": int(win),
+                "max_total_appends": int(max_append_cap),
+                "max_rows_per_source": caps,
+                "master_cols": len(MASTER_KEYS),
             },
         )
 
@@ -267,20 +343,21 @@ def run_master_job(
         passes = 0
         empty_passes = 0
 
-        # NOTE: This "Repeated" is within THIS master job run only.
-        # If you want cross-run repeated marking, we can add a hidden Master_Index tab later.
+        appended_by_source: dict[str, int] = {t: 0 for t in cleaned_sources}
         seen_domains_run: set[str] = set()
-
-        linger_s = max(0.0, float(linger_seconds))
-        empty_cap = max(0, int(max_empty_passes))
-        win = max(10, int(window_rows))
-        max_append_cap = max(1, int(max_total_appends))
 
         while appended_total < max_append_cap:
             passes += 1
+            if max_passes is not None and passes > int(max_passes):
+                break
+
             pass_appended = 0
 
             for tab_name in cleaned_sources:
+                cap = caps.get(tab_name)
+                if cap is not None and appended_by_source.get(tab_name, 0) >= cap:
+                    continue
+
                 maps = _resolve_maps_for_tab(
                     tab_name,
                     domain_col_map=domain_col_map_eff,
@@ -290,15 +367,25 @@ def run_master_job(
                 last_done = watermarks.get(tab_name, 1)
                 start_row = last_done + 1
 
-                # Read a bounded window only (no last-row scan)
-                end_row = start_row + win - 1
-                block = sheets.read_range(tab_name=tab_name, a1_range=f"A{start_row}:Z{end_row}")
+                remaining_cap = None
+                if cap is not None:
+                    remaining_cap = max(0, cap - appended_by_source.get(tab_name, 0))
+                    if remaining_cap <= 0:
+                        continue
+
+                read_rows = win if remaining_cap is None else min(win, max(1, remaining_cap))
+                end_row = start_row + read_rows - 1
+
+                # READS: budgeted by manager
+                block = sheets_mgr.read_range(tab_name=tab_name, a1_range=f"A{start_row}:Z{end_row}")
 
                 eff_n = _block_effective_rows(block)
                 if eff_n <= 0:
                     continue
 
-                # Build Master rows
+                if remaining_cap is not None:
+                    eff_n = min(eff_n, remaining_cap)
+
                 master_rows: list[list[str]] = []
                 for r in block[:eff_n]:
                     company = _safe_get(r, maps.company_col)
@@ -308,36 +395,44 @@ def run_master_job(
                     qsrc = _safe_get(r, maps.query_source_col)
 
                     d_l = domain.lower().strip()
-                    repeated = "YES" if d_l and d_l in seen_domains_run else "NO"
+                    dup = "YES" if d_l and d_l in seen_domains_run else "NO"
                     if d_l:
                         seen_domains_run.add(d_l)
 
-                    master_rows.append(
-                        [
-                            company,
-                            domain,
-                            website,
-                            tab_name,
-                            location,
-                            qsrc,
-                            repeated,
-                        ]
-                    )
+                    row_obj = {
+                        "company": company,
+                        "domain": domain,
+                        "website": website,
+                        "source_tool": tab_name,
+                        "location": location,
+                        "lead_query": qsrc,
+                        "dup_in_run": dup,
+                    }
+                    master_rows.append([row_obj.get(k, "") for k in MASTER_KEYS])
 
                 if master_rows:
-                    sheets.append_rows(tab_name=TAB_MASTER, rows=master_rows)
-                    appended_total += len(master_rows)
-                    pass_appended += len(master_rows)
+                    # WRITE: buffered append (one append per tab per flush)
+                    sheets_mgr.queue_append_rows(tab_name=TAB_MASTER, rows=master_rows)
 
-                # Advance watermark precisely by effective rows consumed
+                    n_app = len(master_rows)
+                    appended_total += n_app
+                    pass_appended += n_app
+                    appended_by_source[tab_name] = appended_by_source.get(tab_name, 0) + n_app
+
+                # Watermarks
                 new_last = last_done + eff_n
                 watermarks[tab_name] = new_last
-                _write_watermark(sheets, source_tab=tab_name, last_row=new_last)
+
+                if not test_mode:
+                    # Persist watermark (bounded scan). Acceptable frequency: once per processed window.
+                    _write_watermark(sheets, source_tab=tab_name, last_row=new_last)
 
                 if appended_total >= max_append_cap:
                     break
 
-            # Status/progress per pass
+            # Ensure buffered writes land periodically (and before formatting)
+            sheets_mgr.flush()
+
             msg = (
                 f"Master pass={passes} appended_this_pass={pass_appended} "
                 f"appended_total={appended_total} empty_passes={empty_passes}/{empty_cap}"
@@ -346,13 +441,14 @@ def run_master_job(
             update_progress(
                 job_id,
                 phase="master",
-                current=min(total_sources, total_sources),  # master isn't “per source” now; keep stable
+                current=total_sources,
                 total=total_sources,
                 message=msg,
                 metrics={
                     "passes": passes,
                     "appended_total": appended_total,
                     "empty_passes": empty_passes,
+                    "appended_by_source": dict(appended_by_source),
                 },
             )
 
@@ -370,11 +466,11 @@ def run_master_job(
                         "passes": passes,
                         "appended_total": appended_total,
                         "empty_passes": empty_passes,
-                        "linger_seconds": linger_s,
+                        "appended_by_source": dict(appended_by_source),
+                        "test_mode": bool(test_mode),
                     },
                 )
 
-            # Linger/stop logic
             if pass_appended == 0:
                 empty_passes += 1
                 if empty_cap == 0 or empty_passes >= empty_cap:
@@ -384,26 +480,56 @@ def run_master_job(
             else:
                 empty_passes = 0
 
-        # Formatting (optional; best-effort)
+        # Final flush to guarantee everything is written
+        sheets_mgr.flush()
+
+        # ---------------------------------------------------------------------
+        # Formatting (requested): layout + duplicate highlighting
+        # ---------------------------------------------------------------------
         if apply_formatting and sheets:
             try:
-                sheet_id = sheets._get_sheet_id_by_title(TAB_MASTER)
+                # NOTE: get_last_row reads a column; OK here since it's once at end.
+                last_row = sheets.get_last_row(tab_name=TAB_MASTER, signal_col=0)
+                if last_row < 2:
+                    last_row = 2
+
+                sheets.format_table_layout(
+                    tab_name=TAB_MASTER,
+                    n_cols=len(MASTER_KEYS),
+                    last_row=last_row,
+                    header_row=True,
+                    auto_resize=True,
+                    wrap_strategy_body="OVERFLOW_CELL",
+                )
+
+                dup_idx = MASTER_KEYS.index("dup_in_run")
+                dup_letter = _col_index_to_a1(dup_idx)
+                formula = f'=${dup_letter}2="YES"'
+
+                sheet_id = sheets.get_sheet_id(TAB_MASTER)
                 if sheet_id is not None:
                     rule = sheets.build_conditional_format_rule_custom_formula(
                         sheet_id=sheet_id,
                         start_row_index=1,
                         start_col_index=0,
-                        end_col_index=7,
-                        formula='=$G2="YES"',
+                        end_col_index=len(MASTER_KEYS),
+                        end_row_index=last_row,
+                        formula=formula,
                         background_rgb=(1.0, 0.85, 0.85),
                     )
                     sheets.replace_conditional_format_rules(tab_name=TAB_MASTER, rules=[rule])
+
             except Exception:
                 logger.exception("MASTER_FORMATTING_FAILED")
 
-        msg = f"Master job completed. appended_total={appended_total} passes={passes} empty_passes={empty_passes}"
+        msg = (
+            f"Master job completed. appended_total={appended_total} "
+            f"passes={passes} empty_passes={empty_passes}"
+        )
         if appended_total >= max_append_cap:
             msg += " (stopped: max_total_appends reached)"
+        elif max_passes is not None and passes > int(max_passes):
+            msg += " (stopped: max_passes reached)"
         elif empty_cap == 0 or empty_passes >= empty_cap:
             msg += " (stopped: idle)"
 
@@ -420,7 +546,14 @@ def run_master_job(
                 current=appended_total,
                 total=max_append_cap,
                 message=msg,
-                meta={"appended_total": appended_total, "passes": passes, "empty_passes": empty_passes},
+                meta={
+                    "appended_total": appended_total,
+                    "passes": passes,
+                    "empty_passes": empty_passes,
+                    "appended_by_source": dict(appended_by_source),
+                    "test_mode": bool(test_mode),
+                    "reset_master_in_test_mode": bool(reset_master_in_test_mode),
+                },
                 force=True,
             )
 

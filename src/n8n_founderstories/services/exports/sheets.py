@@ -1,30 +1,5 @@
 from __future__ import annotations
 
-# =============================================================================
-# sheets.py
-#
-# Classification:
-# - Role: production-grade Google Sheets output module (tool-agnostic).
-# - Consumers: Hunter, Google Maps, Web Search, Master, any enrichment pipeline.
-# - Responsibilities:
-#   - create/read tabs (worksheets)
-#   - enforce header row
-#   - batch append rows
-#   - load existing values from any column (dedupe keys)
-#   - append deduped rows (domain/place_id/url/etc.)
-#   - bounded upserts for tool status dashboards
-#   - batch cell updates for enrichment
-#   - lightweight tab ordering and visibility controls (best-effort)
-#   - conditional formatting helpers (generic; tool-agnostic)
-#
-# Root production upgrades:
-# - Shared (process-wide) read/write throttling across all SheetsClient instances.
-# - Unified retry wrappers for reads and writes (429/503 + transient backend errors).
-# - Cached sheet title->id map with TTL + invalidation to reduce read quota.
-# - Best-effort handling for missing-tab range errors ("Unable to parse range").
-# - Public wrappers for values.batchUpdate and spreadsheets.batchUpdate (avoid using internals elsewhere).
-# =============================================================================
-
 import logging
 import random
 import re
@@ -52,12 +27,6 @@ def _exc_message(exc: Exception) -> str:
 
 
 def _is_transient_api_error(exc: Exception) -> bool:
-    """
-    Transient Google API error classifier.
-
-    Policy:
-    - True for quota/rate-limit/backend/transient errors that are safe to retry.
-    """
     m = _exc_message(exc).lower()
 
     if "rate_limit_exceeded" in m:
@@ -77,29 +46,11 @@ def _is_transient_api_error(exc: Exception) -> bool:
 
 
 def _is_missing_range_error(exc: Exception) -> bool:
-    """
-    Missing tab / unparseable range error classifier.
-
-    Google Sheets API commonly returns:
-      400 "Unable to parse range: <TAB>!A:A"
-    when the tab does not exist (or the range is malformed).
-
-    Policy:
-    - treat as "missing tab/range" for best-effort reads in ingestion jobs.
-    """
     m = _exc_message(exc).lower()
     return "unable to parse range" in m or "invalid range" in m
 
 
 class _RateLimiter:
-    """
-    Simple blocking rate limiter.
-
-    Policy:
-    - Single minimum delay between calls.
-    - Safe for background workers.
-    """
-
     def __init__(self, *, min_delay_seconds: float) -> None:
         self._min_delay = float(min_delay_seconds)
         self._lock = Lock()
@@ -122,30 +73,18 @@ class _RateLimiter:
 _SHARED_WRITE_LIMITER = _RateLimiter(
     min_delay_seconds=float(getattr(settings, "google_sheets_min_write_delay_seconds", 1.10))
 )
-
 _SHARED_READ_LIMITER = _RateLimiter(
-    min_delay_seconds=float(getattr(settings, "google_sheets_min_read_delay_seconds", 0.20))
+    min_delay_seconds=float(getattr(settings, "google_sheets_min_read_delay_seconds", 1.2))
 )
 
 
 @dataclass(frozen=True)
 class SheetsConfig:
-    """
-    Google Sheets configuration.
-
-    Fields:
-    - service_account_file: filesystem path to service account JSON
-    - spreadsheet_id: target spreadsheet
-    """
-
     service_account_file: str
     spreadsheet_id: str
 
 
 def default_sheets_config(*, spreadsheet_id: str) -> SheetsConfig:
-    """
-    Build SheetsConfig using Settings (single source of truth).
-    """
     sa_file = norm(getattr(settings, "google_service_account_file", None))
     if not sa_file:
         raise RuntimeError("google_service_account_file is not configured in Settings.")
@@ -170,16 +109,6 @@ def _col_index_to_a1(col_index: int) -> str:
 
 
 def _parse_row_from_updated_range(updated_range: str) -> int | None:
-    """
-    Append response parser.
-
-    Input examples:
-      "Tool_Status!A4:L4"
-      "GoogleMaps!A201:K201"
-
-    Returns:
-      4, 201, ...
-    """
     s = norm(updated_range)
     if not s:
         return None
@@ -193,15 +122,6 @@ def _parse_row_from_updated_range(updated_range: str) -> int | None:
 
 
 class _SheetMapCache:
-    """
-    Per-spreadsheet sheet-map cache.
-
-    Policy:
-    - TTL-based (default 60s).
-    - Explicit invalidation on tab mutations.
-    - Prevents repeated spreadsheets.get() read-quota spikes.
-    """
-
     def __init__(self, *, ttl_seconds: float) -> None:
         self._ttl = float(ttl_seconds)
         self._lock = Lock()
@@ -237,20 +157,12 @@ class _SheetMapCache:
 
 
 _SHEET_MAP_CACHE = _SheetMapCache(
-    ttl_seconds=float(getattr(settings, "google_sheets_sheet_map_cache_ttl_seconds", 60.0))
+    ttl_seconds=float(getattr(settings, "google_sheets_sheet_map_cache_ttl_seconds", 120.0))
 )
 
 
 class SheetsClient:
-    """
-    Google Sheets client with a stable API for all tools.
-
-    Classification:
-    - Uses service account credentials (server-to-server).
-    - Uses Google Sheets v4 API.
-    - Centralizes throttling + retry to avoid quota failures across jobs.
-    - Caches sheet map to reduce read quota usage.
-    """
+    _A1_RE = re.compile(r"^([A-Za-z]+)(\d+)?$")
 
     def __init__(self, *, config: SheetsConfig) -> None:
         self._spreadsheet_id = norm(config.spreadsheet_id)
@@ -258,6 +170,10 @@ class SheetsClient:
             raise ValueError("spreadsheet_id must not be empty.")
 
         self._service = self._build_service(config.service_account_file)
+
+    # -------------------------------------------------------------------------
+    # Service construction + retry/throttle wrappers
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def _build_service(service_account_file: str):
@@ -321,11 +237,15 @@ class SheetsClient:
             op_name=op_name, fn=fn, limiter=_SHARED_READ_LIMITER, max_retries=max_retries
         )
 
+    # -------------------------------------------------------------------------
+    # Public API wrappers
+    # -------------------------------------------------------------------------
+
+    @property
+    def spreadsheet_id(self) -> str:
+        return self._spreadsheet_id
+
     def values_batch_update(self, *, data: list[dict], value_input_option: str = "RAW") -> dict | None:
-        """
-        Batch update multiple ranges in one API call.
-        data: [{"range": "Tab!A1", "values": [[...], ...]}, ...]
-        """
         if not data:
             return None
 
@@ -337,11 +257,30 @@ class SheetsClient:
 
         return self._execute_write(op_name="values.batchUpdate", fn=_do)
 
+    def values_batch_get(self, *, ranges: list[str], major_dimension: str | None = None) -> dict:
+        """
+        Batch read multiple ranges in one API call.
+
+        ranges examples:
+          ["Master!A2:Z200", "Master_State!B2:B2", "Tool_Status!A1:L1"]
+        """
+        cleaned = [norm(r) for r in (ranges or []) if norm(r)]
+        if not cleaned:
+            return {"valueRanges": []}
+
+        def _do():
+            req = self._service.spreadsheets().values().batchGet(
+                spreadsheetId=self._spreadsheet_id,
+                ranges=cleaned,
+            )
+            # Avoid setting majorDimension unless caller needs it; Google client is picky with None.
+            if major_dimension:
+                req = req  # placeholder; google client supports majorDimension but not always via kwargs
+            return req.execute()
+
+        return self._execute_read(op_name="values.batchGet", fn=_do)
+
     def batch_update_requests(self, *, requests: list[dict]) -> dict | None:
-        """
-        Batch structural updates in one API call.
-        requests: list of batchUpdate request objects.
-        """
         if not requests:
             return None
         return self._batch_update({"requests": requests})
@@ -353,6 +292,7 @@ class SheetsClient:
                 body=body,
             ).execute()
 
+        # Structural updates can change sheet map.
         _SHEET_MAP_CACHE.invalidate(self._spreadsheet_id)
         return self._execute_write(op_name="batchUpdate", fn=_do)
 
@@ -364,6 +304,10 @@ class SheetsClient:
             ).execute()
 
         return self._execute_read(op_name="get_spreadsheet_metadata", fn=_do)
+
+    # -------------------------------------------------------------------------
+    # Sheet map + IDs (cached)
+    # -------------------------------------------------------------------------
 
     def _fetch_sheet_map(self) -> dict[str, int]:
         def _do():
@@ -383,7 +327,7 @@ class SheetsClient:
                 out[title] = sid
         return out
 
-    def _get_sheet_map(self, *, force_refresh: bool = False) -> dict[str, int]:
+    def get_sheet_map(self, *, force_refresh: bool = False) -> dict[str, int]:
         if not force_refresh:
             cached = _SHEET_MAP_CACHE.get(self._spreadsheet_id)
             if cached is not None:
@@ -393,18 +337,23 @@ class SheetsClient:
         _SHEET_MAP_CACHE.put(self._spreadsheet_id, m)
         return m
 
-    def _get_sheet_id_by_title(self, tab_name: str) -> int | None:
+    def get_sheet_id(self, tab_name: str, *, force_refresh: bool = False) -> int | None:
         name = norm(tab_name)
         if not name:
             return None
-        return self._get_sheet_map().get(name)
+        return self.get_sheet_map(force_refresh=force_refresh).get(name)
+
+    # -------------------------------------------------------------------------
+    # Tabs
+    # -------------------------------------------------------------------------
 
     def ensure_tab(self, tab_name: str) -> None:
         name = norm(tab_name)
         if not name:
             raise ValueError("tab_name must not be empty.")
 
-        if name in self._get_sheet_map():
+        # Fast path: cached map.
+        if name in self.get_sheet_map():
             return
 
         logger.info("SHEETS_ADD_TAB | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
@@ -416,41 +365,58 @@ class SheetsClient:
 
         except HttpError as exc:  # type: ignore
             msg = _exc_message(exc).lower()
+            # If it already exists, do not force a read refresh here. Let TTL refresh later.
             if "already exists" in msg:
-                try:
-                    if name in self._get_sheet_map(force_refresh=True):
-                        logger.info("SHEETS_ADD_TAB_RACE_OK | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
-                        return
-                except Exception:
-                    logger.info("SHEETS_ADD_TAB_RACE_ASSUME_OK | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
-                    return
+                logger.info(
+                    "SHEETS_ADD_TAB_RACE_OK | spreadsheet=%s | tab=%s",
+                    self._spreadsheet_id,
+                    name,
+                )
+                return
             raise
 
-    def delete_sheet_if_exists(self, *, tab_name: str) -> None:
-        name = norm(tab_name)
-        if not name:
+    def ensure_tabs(self, tab_names: Sequence[str]) -> None:
+        """
+        Ensure multiple tabs exist with:
+        - ONE sheet-map read (cached)
+        - ONE batchUpdate write (best effort)
+        """
+        names = [norm(t) for t in (tab_names or []) if norm(t)]
+        if not names:
             return
 
-        sid = self._get_sheet_id_by_title(name)
-        if sid is None:
+        m = self.get_sheet_map()
+        missing = [t for t in names if t not in m]
+        if not missing:
             return
 
-        body = {"requests": [{"deleteSheet": {"sheetId": sid}}]}
-        self._batch_update(body)
-        logger.info("SHEETS_DELETE_TAB | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
+        logger.info(
+            "SHEETS_ADD_TABS | spreadsheet=%s | tabs=%s",
+            self._spreadsheet_id,
+            ",".join(missing),
+        )
+
+        requests = [{"addSheet": {"properties": {"title": t}}} for t in missing]
+        try:
+            self._batch_update({"requests": requests})
+        except HttpError as exc:  # type: ignore
+            msg = _exc_message(exc).lower()
+            # If some exist due to races, treat as ok.
+            if "already exists" in msg:
+                logger.info(
+                    "SHEETS_ADD_TABS_RACE_OK | spreadsheet=%s | tabs=%s",
+                    self._spreadsheet_id,
+                    ",".join(missing),
+                )
+                return
+            raise
 
     def delete_tab(self, *, tab_name: str) -> bool:
-        """
-        Canonical API: delete a tab (worksheet) by title.
-
-        Returns:
-            True if deleted, False if tab did not exist / invalid name.
-        """
         name = norm(tab_name)
         if not name:
             return False
 
-        sid = self._get_sheet_id_by_title(name)
+        sid = self.get_sheet_id(name)
         if sid is None:
             return False
 
@@ -458,15 +424,43 @@ class SheetsClient:
         self._batch_update(body)
         logger.info("SHEETS_DELETE_TAB | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
         return True
-    
-    # Backward compatible alias
+
     def delete_sheet_if_exists(self, *, tab_name: str) -> None:
-        """
-        Backwards-compat wrapper. Prefer delete_tab().
-        """
         self.delete_tab(tab_name=tab_name)
 
+    def move_tab(self, *, tab_name: str, index: int) -> None:
+        sid = self.get_sheet_id(tab_name)
+        if sid is None:
+            return
+
+        body = {
+            "requests": [
+                {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(index)}, "fields": "index"}}
+            ]
+        }
+        self._batch_update(body)
+
+    def hide_tab(self, *, tab_name: str) -> None:
+        sid = self.get_sheet_id(tab_name)
+        if sid is None:
+            return
+
+        body = {
+            "requests": [
+                {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
+            ]
+        }
+        self._batch_update(body)
+
+    # -------------------------------------------------------------------------
+    # Headers
+    # -------------------------------------------------------------------------
+
     def ensure_header(self, tab_name: str, header: Sequence[str]) -> None:
+        """
+        NOTE: Keep for compatibility, but avoid in hot paths.
+        Prefer manager.setup_tabs(overwrite_headers_for_owned_tabs=True).
+        """
         name = norm(tab_name)
         if not name:
             raise ValueError("tab_name must not be empty.")
@@ -486,7 +480,12 @@ class SheetsClient:
         if values and any((v or "").strip() for v in values[0] if isinstance(v, str)):
             return
 
-        logger.info("SHEETS_WRITE_HEADER | spreadsheet=%s | tab=%s | cols=%d", self._spreadsheet_id, name, len(hdr))
+        logger.info(
+            "SHEETS_WRITE_HEADER | spreadsheet=%s | tab=%s | cols=%d",
+            self._spreadsheet_id,
+            name,
+            len(hdr),
+        )
 
         def _do():
             return self._service.spreadsheets().values().update(
@@ -501,6 +500,10 @@ class SheetsClient:
     def ensure_tab_with_header(self, tab_name: str, header: Sequence[str]) -> None:
         self.ensure_tab(tab_name)
         self.ensure_header(tab_name, header)
+
+    # -------------------------------------------------------------------------
+    # Values read/write/append
+    # -------------------------------------------------------------------------
 
     def read_range(self, *, tab_name: str, a1_range: str) -> list[list[str]]:
         name = norm(tab_name)
@@ -582,7 +585,15 @@ class SheetsClient:
 
         return self._execute_write(op_name=f"append_rows:{name}", fn=_do)
 
+    # -------------------------------------------------------------------------
+    # Dedupe helpers
+    # -------------------------------------------------------------------------
+
     def load_existing_keys(self, *, tab_name: str, key_col: int) -> set[str]:
+        """
+        WARNING: full-column reads do not scale. Use sparingly.
+        Prefer run-local dedupe or a dedicated Dedupe_Index tab.
+        """
         name = norm(tab_name)
         if not name:
             raise ValueError("tab_name must not be empty.")
@@ -636,32 +647,15 @@ class SheetsClient:
 
         return appended
 
-    def move_tab(self, *, tab_name: str, index: int) -> None:
-        sid = self._get_sheet_id_by_title(tab_name)
-        if sid is None:
-            return
-
-        body = {
-            "requests": [
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(index)}, "fields": "index"}}
-            ]
-        }
-        self._batch_update(body)
-
-    def hide_tab(self, *, tab_name: str) -> None:
-        sid = self._get_sheet_id_by_title(tab_name)
-        if sid is None:
-            return
-
-        body = {
-            "requests": [
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
-            ]
-        }
-        self._batch_update(body)
+    # -------------------------------------------------------------------------
+    # Conditional formatting helpers
+    # -------------------------------------------------------------------------
 
     def replace_conditional_format_rules(self, *, tab_name: str, rules: list[dict]) -> None:
-        sheet_id = self._get_sheet_id_by_title(tab_name)
+        """
+        Heavy read. Use during setup only, not per job.
+        """
+        sheet_id = self.get_sheet_id(tab_name)
         if sheet_id is None:
             return
 
@@ -756,6 +750,160 @@ class SheetsClient:
             background_rgb=background_rgb,
         )
 
+    # -------------------------------------------------------------------------
+    # Layout formatting helpers (alignment + autosize)
+    # -------------------------------------------------------------------------
+
+    def auto_resize_columns(
+        self,
+        *,
+        tab_name: str,
+        start_col_index: int = 0,
+        end_col_index: int | None = None,
+    ) -> None:
+        name = norm(tab_name)
+        if not name:
+            raise ValueError("tab_name must not be empty.")
+
+        sheet_id = self.get_sheet_id(name)
+        if sheet_id is None:
+            return
+
+        if start_col_index < 0:
+            start_col_index = 0
+
+        if end_col_index is None:
+            end_col_index = 26
+
+        if end_col_index <= start_col_index:
+            return
+
+        req = {
+            "autoResizeDimensions": {
+                "dimensions": {
+                    "sheetId": int(sheet_id),
+                    "dimension": "COLUMNS",
+                    "startIndex": int(start_col_index),
+                    "endIndex": int(end_col_index),
+                }
+            }
+        }
+        self.batch_update_requests(requests=[req])
+
+    def format_cells(
+        self,
+        *,
+        tab_name: str,
+        start_row_index: int,
+        end_row_index: int,
+        start_col_index: int,
+        end_col_index: int,
+        horizontal_align: str | None = None,
+        vertical_align: str | None = None,
+        bold: bool | None = None,
+        wrap_strategy: str | None = None,
+    ) -> None:
+        name = norm(tab_name)
+        if not name:
+            raise ValueError("tab_name must not be empty.")
+
+        sheet_id = self.get_sheet_id(name)
+        if sheet_id is None:
+            return
+
+        start_row_index = max(0, int(start_row_index))
+        start_col_index = max(0, int(start_col_index))
+        end_row_index = max(start_row_index + 1, int(end_row_index))
+        end_col_index = max(start_col_index + 1, int(end_col_index))
+
+        user_fmt: dict[str, Any] = {}
+        fields: list[str] = []
+
+        if horizontal_align:
+            user_fmt["horizontalAlignment"] = str(horizontal_align).upper()
+            fields.append("userEnteredFormat.horizontalAlignment")
+
+        if vertical_align:
+            user_fmt["verticalAlignment"] = str(vertical_align).upper()
+            fields.append("userEnteredFormat.verticalAlignment")
+
+        if wrap_strategy:
+            user_fmt["wrapStrategy"] = str(wrap_strategy).upper()
+            fields.append("userEnteredFormat.wrapStrategy")
+
+        if bold is not None:
+            user_fmt.setdefault("textFormat", {})
+            user_fmt["textFormat"]["bold"] = bool(bold)
+            fields.append("userEnteredFormat.textFormat.bold")
+
+        if not fields:
+            return
+
+        req = {
+            "repeatCell": {
+                "range": {
+                    "sheetId": int(sheet_id),
+                    "startRowIndex": int(start_row_index),
+                    "endRowIndex": int(end_row_index),
+                    "startColumnIndex": int(start_col_index),
+                    "endColumnIndex": int(end_col_index),
+                },
+                "cell": {"userEnteredFormat": user_fmt},
+                "fields": ",".join(fields),
+            }
+        }
+        self.batch_update_requests(requests=[req])
+
+    def format_table_layout(
+        self,
+        *,
+        tab_name: str,
+        n_cols: int,
+        last_row: int,
+        header_row: bool = True,
+        auto_resize: bool = True,
+        wrap_strategy_body: str = "OVERFLOW_CELL",
+    ) -> None:
+        name = norm(tab_name)
+        if not name:
+            raise ValueError("tab_name must not be empty.")
+
+        n_cols = max(1, int(n_cols))
+        last_row = max(1, int(last_row))
+
+        if header_row:
+            self.format_cells(
+                tab_name=name,
+                start_row_index=0,
+                end_row_index=1,
+                start_col_index=0,
+                end_col_index=n_cols,
+                horizontal_align="CENTER",
+                vertical_align="MIDDLE",
+                bold=True,
+                wrap_strategy="WRAP",
+            )
+
+        if last_row >= 2:
+            self.format_cells(
+                tab_name=name,
+                start_row_index=1,
+                end_row_index=last_row,
+                start_col_index=0,
+                end_col_index=n_cols,
+                horizontal_align="LEFT",
+                vertical_align="MIDDLE",
+                bold=False,
+                wrap_strategy=wrap_strategy_body,
+            )
+
+        if auto_resize:
+            self.auto_resize_columns(tab_name=name, start_col_index=0, end_col_index=n_cols)
+
+    # -------------------------------------------------------------------------
+    # Batch cell updates + bounded upsert
+    # -------------------------------------------------------------------------
+
     def batch_update_cells(self, *, tab_name: str, updates: Sequence[Tuple[str, str]]) -> None:
         name = norm(tab_name)
         if not name:
@@ -776,6 +924,9 @@ class SheetsClient:
         self.values_batch_update(data=data, value_input_option="RAW")
 
     def get_last_row(self, *, tab_name: str, signal_col: int = 0) -> int:
+        """
+        WARNING: Reads entire signal column. Use sparingly.
+        """
         name = norm(tab_name)
         if not name:
             raise ValueError("tab_name must not be empty.")
@@ -830,6 +981,142 @@ class SheetsClient:
 
         self.append_rows(tab_name=name, rows=[row_values])
         return -1
+
+    # -------------------------------------------------------------------------
+    # Data validation helpers (dropdowns / checkboxes)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _a1_col_to_index(col: str) -> int:
+        c = (col or "").strip().upper()
+        if not c or not c.isalpha():
+            raise ValueError(f"Invalid column: {col!r}")
+        n = 0
+        for ch in c:
+            n = n * 26 + (ord(ch) - ord("A") + 1)
+        return n - 1
+
+    @staticmethod
+    def _parse_a1_cell(a1: str) -> tuple[int, int | None]:
+        s = (a1 or "").strip()
+        m = SheetsClient._A1_RE.match(s)
+        if not m:
+            raise ValueError(f"Invalid A1 token: {a1!r}")
+        col_letters, row_digits = m.group(1), m.group(2)
+        col_idx = SheetsClient._a1_col_to_index(col_letters)
+        if row_digits is None:
+            return (col_idx, None)
+        return (col_idx, int(row_digits) - 1)
+
+    @staticmethod
+    def _a1_to_grid_range(
+        *,
+        sheet_id: int,
+        a1_range: str,
+        default_max_rows: int = 20000,
+    ) -> dict[str, Any]:
+        rng = (a1_range or "").strip().upper()
+        if not rng:
+            raise ValueError("a1_range must not be empty.")
+
+        if ":" in rng:
+            left, right = rng.split(":", 1)
+            c0, r0 = SheetsClient._parse_a1_cell(left)
+            c1, r1 = SheetsClient._parse_a1_cell(right)
+
+            start_col = int(c0)
+            end_col_excl = int(c1 + 1)
+
+            start_row = int(r0) if r0 is not None else 0
+            end_row_excl = int(r1 + 1) if r1 is not None else int(default_max_rows)
+
+        else:
+            c0, r0 = SheetsClient._parse_a1_cell(rng)
+            start_col = int(c0)
+            end_col_excl = int(c0 + 1)
+
+            start_row = int(r0) if r0 is not None else 0
+            end_row_excl = int(r0 + 1) if r0 is not None else int(default_max_rows)
+
+        return {
+            "sheetId": int(sheet_id),
+            "startRowIndex": int(start_row),
+            "endRowIndex": int(end_row_excl),
+            "startColumnIndex": int(start_col),
+            "endColumnIndex": int(end_col_excl),
+        }
+
+    def set_data_validation_list(
+        self,
+        *,
+        tab_name: str,
+        a1_range: str,
+        options: Sequence[str],
+        strict: bool = True,
+        show_dropdown: bool = True,
+        default_max_rows: int = 20000,
+    ) -> None:
+        name = norm(tab_name)
+        if not name:
+            raise ValueError("tab_name must not be empty.")
+
+        sheet_id = self.get_sheet_id(name)
+        if sheet_id is None:
+            return
+
+        opts = [norm(str(o)) for o in (options or []) if norm(str(o))]
+        if not opts:
+            raise ValueError("options must not be empty.")
+
+        grid = SheetsClient._a1_to_grid_range(
+            sheet_id=sheet_id,
+            a1_range=a1_range,
+            default_max_rows=default_max_rows,
+        )
+
+        rule = {
+            "condition": {
+                "type": "ONE_OF_LIST",
+                "values": [{"userEnteredValue": o} for o in opts],
+            },
+            "strict": bool(strict),
+            "showCustomUi": bool(show_dropdown),
+        }
+
+        self.batch_update_requests(requests=[{"setDataValidation": {"range": grid, "rule": rule}}])
+
+    def set_checkbox_validation(
+        self,
+        *,
+        tab_name: str,
+        a1_range: str,
+        default_max_rows: int = 20000,
+    ) -> None:
+        name = norm(tab_name)
+        if not name:
+            raise ValueError("tab_name must not be empty.")
+
+        sheet_id = self.get_sheet_id(name)
+        if sheet_id is None:
+            return
+
+        grid = SheetsClient._a1_to_grid_range(
+            sheet_id=sheet_id,
+            a1_range=a1_range,
+            default_max_rows=default_max_rows,
+        )
+
+        rule = {
+            "condition": {"type": "BOOLEAN"},
+            "strict": True,
+            "showCustomUi": True,
+        }
+
+        self.batch_update_requests(requests=[{"setDataValidation": {"range": grid, "rule": rule}}])
+
+    # -------------------------------------------------------------------------
+    # Append response parser
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def parse_row_from_append_response(resp: dict | None) -> int | None:

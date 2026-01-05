@@ -12,6 +12,20 @@ from ...core.utils.text import norm
 
 logger = logging.getLogger(__name__)
 
+# Process-local lock per spreadsheet (prevents repeated setup within same process).
+_SPREADSHEET_LOCKS: Dict[str, Lock] = {}
+_SPREADSHEET_LOCKS_GUARD = Lock()
+
+
+def _get_spreadsheet_lock(spreadsheet_id: str) -> Lock:
+    sid = norm(spreadsheet_id)
+    with _SPREADSHEET_LOCKS_GUARD:
+        lock = _SPREADSHEET_LOCKS.get(sid)
+        if lock is None:
+            lock = Lock()
+            _SPREADSHEET_LOCKS[sid] = lock
+        return lock
+
 
 class _RequestBudget:
     """
@@ -60,8 +74,6 @@ class GoogleSheetsManager:
     - buffers and batches writes
     - enforces request budgets
     - provides interval-based flushing
-
-    NEW:
     - buffers appends and flushes as 1 append per tab per flush
     """
 
@@ -72,7 +84,7 @@ class GoogleSheetsManager:
         default_factory=lambda: int(getattr(settings, "google_sheets_write_budget_per_minute", 55))
     )
     read_budget_per_minute: int = field(
-        default_factory=lambda: int(getattr(settings, "google_sheets_read_budget_per_minute", 55))
+        default_factory=lambda: int(getattr(settings, "google_sheets_read_budget_per_minute", 45))
     )
 
     # flush policy (size-based)
@@ -83,7 +95,7 @@ class GoogleSheetsManager:
         default_factory=lambda: int(getattr(settings, "google_sheets_flush_max_batch_requests", 50))
     )
 
-    # NEW: append buffering knobs
+    # append buffering knobs
     flush_max_append_tabs: int = field(
         default_factory=lambda: int(getattr(settings, "google_sheets_flush_max_append_tabs", 10))
     )
@@ -100,7 +112,6 @@ class GoogleSheetsManager:
     _values_updates: Dict[Tuple[str, str], _BufferedValuesUpdate] = field(default_factory=dict, init=False)
     _batch_requests: List[dict] = field(default_factory=list, init=False)
 
-    # NEW: append buffer per tab
     _append_rows_by_tab: Dict[str, List[List[str]]] = field(default_factory=dict, init=False)
 
     _last_flush_ts: float = field(default_factory=lambda: 0.0, init=False)
@@ -113,22 +124,57 @@ class GoogleSheetsManager:
         self._read_budget = _RequestBudget(per_minute=self.read_budget_per_minute)
 
     # -------------------------------------------------------------------------
-    # Budgeted read wrapper
+    # Budgeted read wrappers
     # -------------------------------------------------------------------------
 
     def read_range(self, *, tab_name: str, a1_range: str) -> List[List[str]]:
         self._read_budget.wait_for_slot()
         return self.client.read_range(tab_name=tab_name, a1_range=a1_range)
 
+    def batch_get(self, *, tab_ranges: Sequence[Tuple[str, str]]) -> List[List[List[str]]]:
+        """
+        Batch read multiple ranges with ONE API call.
+
+        tab_ranges: [(tab, "A2:Z200"), (tab, "B2:B2"), ...]
+        Returns a list aligned with tab_ranges; each element is a 2D list (rows x cols).
+        """
+        ranges: List[str] = []
+        for t, r in (tab_ranges or []):
+            tn = norm(t)
+            rn = norm(r)
+            if tn and rn:
+                ranges.append(f"{tn}!{rn}")
+
+        self._read_budget.wait_for_slot()
+        resp = self.client.values_batch_get(ranges=ranges)
+        value_ranges = (resp or {}).get("valueRanges") or []
+
+        out: List[List[List[str]]] = []
+        for vr in value_ranges:
+            values = (vr or {}).get("values") or []
+            cleaned: List[List[str]] = []
+            for row in values:
+                if isinstance(row, list):
+                    cleaned.append([norm(str(c)) for c in row])
+            out.append(cleaned)
+
+        # Ensure alignment even if API returns fewer ranges.
+        while len(out) < len(ranges):
+            out.append([])
+
+        return out
+
+    def read_cell(self, *, tab_name: str, cell: str) -> str:
+        vals = self.read_range(tab_name=tab_name, a1_range=cell)
+        if not vals or not vals[0]:
+            return ""
+        return norm(vals[0][0])
+
     # -------------------------------------------------------------------------
     # Queue APIs (buffering + flush triggers)
     # -------------------------------------------------------------------------
 
     def queue_values_update(self, *, tab_name: str, a1_range: str, values: Sequence[Sequence[str]]) -> None:
-        """
-        Buffer a values update. If same (tab, range) is queued multiple times,
-        last one wins.
-        """
         t = norm(tab_name)
         r = norm(a1_range)
         if not t or not r or not values:
@@ -152,21 +198,13 @@ class GoogleSheetsManager:
                 logger.exception("SHEETS_MANAGER_FLUSH_FAILED (values)")
 
     def delete_default_sheet_best_effort(self) -> None:
-        """
-        Delete default 'Sheet1' tab if it exists.
-        Safe to call multiple times.
-        """
         try:
             if self.client.delete_tab(tab_name="Sheet1"):
                 logger.info("SHEETS_DELETE_DEFAULT | Sheet1")
         except Exception:
             logger.exception("SHEETS_DELETE_DEFAULT_FAILED")
 
-
     def queue_batch_update_request(self, request: dict) -> None:
-        """
-        Buffer a single spreadsheets.batchUpdate request object.
-        """
         if not isinstance(request, dict):
             return
 
@@ -188,12 +226,6 @@ class GoogleSheetsManager:
                 logger.exception("SHEETS_MANAGER_FLUSH_FAILED (batchUpdate)")
 
     def queue_append_rows(self, *, tab_name: str, rows: Sequence[Sequence[str]]) -> None:
-        """
-        Buffer append rows. Rows are appended in-order per tab on flush.
-
-        Policy:
-        - 1 append per tab per flush (best effort).
-        """
         t = norm(tab_name)
         if not t or not rows:
             return
@@ -229,14 +261,6 @@ class GoogleSheetsManager:
     # -------------------------------------------------------------------------
 
     def flush(self) -> None:
-        """
-        Flush buffered writes in as few API calls as possible.
-
-        Order:
-        1) values.batchUpdate (single call)
-        2) spreadsheets.batchUpdate (single call)
-        3) values.append (one call per tab with buffered rows)
-        """
         with self._lock:
             values_items = list(self._values_updates.values())
             batch_reqs = list(self._batch_requests)
@@ -293,6 +317,22 @@ class GoogleSheetsManager:
             raise
 
     # -------------------------------------------------------------------------
+    # Initialization marker (prevents repeated setup in same process)
+    # -------------------------------------------------------------------------
+
+    def is_initialized(self, *, tab_name: str = "Dashboard", cell: str = "A1", marker_prefix: str = "__INIT_DONE__") -> bool:
+        try:
+            v = self.read_cell(tab_name=tab_name, cell=cell)
+            return v.startswith(marker_prefix)
+        except Exception:
+            return False
+
+    def write_init_marker(self, *, tab_name: str = "Dashboard", cell: str = "A1", marker: str | None = None) -> None:
+        if marker is None:
+            marker = f"__INIT_DONE__:{int(time.time())}"
+        self.queue_values_update(tab_name=tab_name, a1_range=cell, values=[[marker]])
+
+    # -------------------------------------------------------------------------
     # High-level convenience ops
     # -------------------------------------------------------------------------
 
@@ -304,58 +344,83 @@ class GoogleSheetsManager:
         tab_order: Sequence[str] = (),
         tab_colors: Optional[Dict[str, Tuple[float, float, float]]] = None,
         overwrite_headers_for_owned_tabs: bool = True,
+        init_marker_tab: str = "Dashboard",
+        init_marker_cell: str = "A1",
+        init_marker_prefix: str = "__INIT_DONE__",
     ) -> None:
         """
         Standard workbook setup.
-        - Ensures tabs exist.
-        - Writes headers (either overwrite in one batch, or ensure_header with reads).
-        - Buffers structural changes and flushes once.
+
+        Key production behaviors:
+        - Bulk tab creation (one sheet-map read, one batchUpdate write).
+        - Optional init marker to avoid repeated setup.
+        - Avoid ensure_header (reads) by overwriting headers in one batch update.
+
+        Note:
+        - This lock is process-local. If you run multiple processes, add a distributed lock (Redis).
         """
-        for tab, _hdr in headers:
-            self.client.ensure_tab(tab)
+        spreadsheet_lock = _get_spreadsheet_lock(self.client.spreadsheet_id)
 
-        # Headers
-        if overwrite_headers_for_owned_tabs:
-            for tab, hdr in headers:
-                self.queue_values_update(tab_name=tab, a1_range="A1", values=[list(hdr)])
-        else:
-            for tab, hdr in headers:
-                self.client.ensure_header(tab, hdr)
+        with spreadsheet_lock:
+            # Skip if already initialized (one read)
+            if self.is_initialized(tab_name=init_marker_tab, cell=init_marker_cell, marker_prefix=init_marker_prefix):
+                return
 
-        # Hide tabs
-        for t in hide_tabs:
-            sid = self.client._get_sheet_id_by_title(t)
-            if sid is None:
-                continue
-            self.queue_batch_update_request(
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
-            )
+            tabs = [t for t, _ in headers]
+            # Ensure marker tab exists too
+            if norm(init_marker_tab) and init_marker_tab not in tabs:
+                tabs = [init_marker_tab] + tabs
 
-        # Reorder tabs
-        for idx, t in enumerate(tab_order):
-            sid = self.client._get_sheet_id_by_title(t)
-            if sid is None:
-                continue
-            self.queue_batch_update_request(
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(idx)}, "fields": "index"}}
-            )
+            # 1) Ensure tabs exist in bulk
+            self.client.ensure_tabs(tabs)
 
-        # Tab colors
-        if tab_colors:
-            for t, (r, g, b) in tab_colors.items():
-                sid = self.client._get_sheet_id_by_title(t)
+            # 2) Headers
+            if overwrite_headers_for_owned_tabs:
+                for tab, hdr in headers:
+                    self.queue_values_update(tab_name=tab, a1_range="A1", values=[list(hdr)])
+            else:
+                # Avoid this in hot paths; it reads row 1
+                for tab, hdr in headers:
+                    self.client.ensure_header(tab, hdr)
+
+            # 3) Hide tabs
+            for t in hide_tabs:
+                sid = self.client.get_sheet_id(t)
                 if sid is None:
                     continue
                 self.queue_batch_update_request(
-                    {
-                        "updateSheetProperties": {
-                            "properties": {
-                                "sheetId": sid,
-                                "tabColor": {"red": float(r), "green": float(g), "blue": float(b)},
-                            },
-                            "fields": "tabColor",
-                        }
-                    }
+                    {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
                 )
-        self.delete_default_sheet_best_effort()
-        self.flush()
+
+            # 4) Reorder tabs
+            for idx, t in enumerate(tab_order):
+                sid = self.client.get_sheet_id(t)
+                if sid is None:
+                    continue
+                self.queue_batch_update_request(
+                    {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(idx)}, "fields": "index"}}
+                )
+
+            # 5) Tab colors
+            if tab_colors:
+                for t, (r, g, b) in tab_colors.items():
+                    sid = self.client.get_sheet_id(t)
+                    if sid is None:
+                        continue
+                    self.queue_batch_update_request(
+                        {
+                            "updateSheetProperties": {
+                                "properties": {
+                                    "sheetId": sid,
+                                    "tabColor": {"red": float(r), "green": float(g), "blue": float(b)},
+                                },
+                                "fields": "tabColor",
+                            }
+                        }
+                    )
+
+            self.delete_default_sheet_best_effort()
+
+            # 6) Write init marker last, then flush once
+            self.write_init_marker(tab_name=init_marker_tab, cell=init_marker_cell)
+            self.flush()
