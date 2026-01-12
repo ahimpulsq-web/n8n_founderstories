@@ -1,566 +1,814 @@
-# =============================================================================
-# runner.py (Master ingestion) — UPDATED FOR SHEETS MANAGER (BUFFERED WRITES)
-#
-# Changes vs your current version:
-# - Uses GoogleSheetsManager for buffered writes (append + headers + structural ops batching).
-# - Removes any private SheetsClient usage (no _get_sheet_id_by_title).
-# - Uses SheetsClient.get_sheet_id() for conditional formatting.
-# - Keeps your TEST MODE restart behavior intact.
-# =============================================================================
+"""
+DB-first Master runner for tool-agnostic result aggregation.
+
+This module replaces the Sheets-driven Master logic with a DB-first approach:
+- Reads from tool DB tables (Hunter, Google Maps, etc.) using adapters
+- Aggregates results into master_results table with idempotent upserts
+- Tracks watermarks per tool for incremental ingestion
+- Exports to Sheets only at job end (optional)
+- Safe under parallel tool execution and rerunnable
+"""
 
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional, Set
 
-from ..exports.sheets import SheetsClient, default_sheets_config
-from ..exports.sheets_manager import GoogleSheetsManager  # <-- NEW
+from ...core.config import settings
+from ...core.utils.text import norm
 from ..jobs.logging import job_logger
+from ..jobs.models import JobState
 from ..jobs.sheets_status import ToolStatusWriter
-from ..jobs.store import mark_failed, mark_running, mark_succeeded, update_progress
-from ..search_plan import SearchPlan
+from ..jobs.store import find_job_by_request_and_tool, mark_failed, mark_running, mark_succeeded, update_progress
+from ..exports.sheets import SheetsClient, default_sheets_config
+
+from .adapters import BaseSourceAdapter, get_available_adapters, get_adapter_by_name
+from .models import MasterRow
+from .repos import MasterResultsRepository, MasterWatermarkRepository, PermanentError
+
 
 logger = logging.getLogger(__name__)
 
-TAB_MASTER = "Master"
-TAB_MASTER_STATE = "Master_State"
-
-# ---------------------------------------------------------------------------
-# SINGLE SOURCE OF TRUTH: schema keys + header labels
-# ---------------------------------------------------------------------------
-MASTER_SCHEMA: list[tuple[str, str]] = [
-    ("company", "Company Name"),
-    ("domain", "Primary Domain"),
-    ("website", "Website URL"),
-    ("source_tool", "Source Tool"),
-    ("location", "Location"),
-    ("lead_query", "Lead Source Query"),
-    ("dup_in_run", "Duplicate (This Run)"),
-]
-
-MASTER_KEYS = [k for (k, _label) in MASTER_SCHEMA]
-MASTER_HEADERS = [label for (_k, label) in MASTER_SCHEMA]
-
-STATE_HEADERS = [
-    "Source Tab",
-    "Last Processed Row",
-    "Updated At (UTC)",
-]
-
-DEFAULT_DOMAIN_COL_MAP: dict[str, int] = {
-    "HunterIO": 0,
-    "GoogleMaps": 6,
-    "GoogleSearch": 1,
-}
-
-DEFAULT_COLUMN_MAP: dict[str, dict[str, int]] = {
-    "HunterIO": {
-        "company": 1,
-        "domain": 0,
-        "website": 0,
-        "location": 2,
-        "query_source": 6,
-    },
-    "GoogleMaps": {
-        "company": 0,
-        "domain": 6,
-        "website": 5,
-        "location": 1,
-        "query_source": 8,
-    },
-    "GoogleSearch": {
-        "company": 0,
-        "domain": 1,
-        "website": 2,
-        "location": -1,
-        "query_source": 6,
-    },
-}
-
-DEFAULT_TEST_CAPS: dict[str, int] = {
-    "HunterIO": 10,
-    "GoogleMaps": 5,
-    "GoogleSearch": 5,
-}
-
-STATUS_EVERY_N_PASSES = 1
-
 
 def _utc_now_iso() -> str:
+    """Return current UTC time as ISO string."""
     return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_get(row: list[str], idx: int) -> str:
-    if idx is None or idx < 0:
-        return ""
-    if idx >= len(row):
-        return ""
-    return (row[idx] or "").strip()
-
-
-def _row_is_empty(row: list[str]) -> bool:
-    if not row:
-        return True
-    return all(not (c or "").strip() for c in row)
-
-
-def _block_effective_rows(block: list[list[str]]) -> int:
+def _convert_results_to_sheets_format(results: List[dict]) -> List[List[str]]:
     """
-    Returns count of effective (non-empty) rows until the first fully-empty row.
-    This makes window reads safe without knowing last_row.
+    Convert DB results to Sheets row format (3-column: organisation, domain, source).
+    
+    Args:
+        results: List of master_results dictionaries from DB
+        
+    Returns:
+        List of rows in Sheets format with 3 columns
     """
-    n = 0
-    for r in block:
-        if _row_is_empty(r):
-            break
-        n += 1
-    return n
+    sheets_rows = []
+    
+    for result in results:
+        row = [
+            norm(result.get('company', '')),      # Organisation
+            norm(result.get('domain', '')),       # Domain (can be empty)
+            norm(result.get('source_tool', '')),  # Source
+        ]
+        sheets_rows.append(row)
+    
+    return sheets_rows
 
 
-def _col_index_to_a1(col_index: int) -> str:
-    if col_index < 0:
-        raise ValueError("col_index must be >= 0")
-    n = col_index + 1
-    letters: list[str] = []
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
-        letters.append(chr(ord("A") + rem))
-    return "".join(reversed(letters))
+def _create_audit_rows(*, request_id: str, results: List[dict]) -> List[List[str]]:
+    """
+    Create audit summary rows from results.
+    
+    Args:
+        request_id: Request identifier
+        results: List of master_results dictionaries from DB
+        
+    Returns:
+        List of audit rows in Sheets format
+    """
+    # Compute statistics by source tool
+    stats_by_tool: dict[str, dict] = {}
+    
+    for result in results:
+        tool = result.get('source_tool', 'Unknown')
+        domain = result.get('domain', '').lower().strip()
+        is_dup = result.get('dup_in_run', 'NO') == 'YES'
+        
+        if tool not in stats_by_tool:
+            stats_by_tool[tool] = {
+                'total': 0,
+                'unique_domains': set(),
+                'duplicates': 0,
+                'last_updated': result.get('updated_at', ''),
+            }
+        
+        stats_by_tool[tool]['total'] += 1
+        if domain:
+            stats_by_tool[tool]['unique_domains'].add(domain)
+        if is_dup:
+            stats_by_tool[tool]['duplicates'] += 1
+        
+        # Track latest updated_at
+        updated_at = result.get('updated_at', '')
+        if updated_at > stats_by_tool[tool]['last_updated']:
+            stats_by_tool[tool]['last_updated'] = updated_at
+    
+    # Convert to rows
+    audit_rows = []
+    for tool, stats in sorted(stats_by_tool.items()):
+        row = [
+            request_id,
+            tool,
+            str(stats['total']),
+            str(len(stats['unique_domains'])),
+            str(stats['duplicates']),
+            stats['last_updated'],
+        ]
+        audit_rows.append(row)
+    
+    return audit_rows
 
 
-def _load_watermarks(sheets_mgr: GoogleSheetsManager) -> dict[str, int]:
-    rows = sheets_mgr.read_range(tab_name=TAB_MASTER_STATE, a1_range="A2:B")
-    out: dict[str, int] = {}
-    for r in rows:
-        if not r:
+def _has_data_for_request(request_id: str, adapters: List[BaseSourceAdapter]) -> bool:
+    """
+    Peek check: Determine if any adapter has data for this request.
+    
+    This prevents Master from running before tools have persisted data,
+    avoiding noisy "MASTER_NO_ADAPTERS" runs.
+    
+    Args:
+        request_id: Request identifier
+        adapters: List of adapters to check
+        
+    Returns:
+        True if at least one adapter has data, False otherwise
+    """
+    for adapter in adapters:
+        if not adapter.table_exists():
             continue
-        tab = (r[0] or "").strip()
-        if not tab:
-            continue
+        
         try:
-            last_row = int((r[1] or "1").strip())
+            # Cheap existence check: SELECT 1 ... LIMIT 1
+            success, error, rows, _ = adapter.fetch_rows_after_watermark(
+                request_id=request_id,
+                watermark=None,
+                limit=1
+            )
+            if success and rows:
+                return True
         except Exception:
-            last_row = 1
-        out[tab] = max(1, last_row)
-    return out
+            continue
+    
+    return False
 
 
-def _write_watermark(sheets: SheetsClient, *, source_tab: str, last_row: int) -> None:
-    # NOTE: This still does a bounded scan. That is acceptable in production
-    # because it runs once per "window" processed, not per row.
-    sheets.upsert_row_by_key(
-        tab_name=TAB_MASTER_STATE,
-        key=source_tab,
-        row_values=[source_tab, str(int(last_row)), _utc_now_iso()],
-        key_col_letter="A",
-        start_row=2,
-        max_scan_rows=2000,
-    )
+def _has_new_data_after_watermarks(
+    request_id: str,
+    adapters: List[BaseSourceAdapter],
+    watermarks: dict[str, Optional[datetime]],
+    dsn: Optional[str] = None
+) -> tuple[bool, Optional[str]]:
+    """
+    Delta check: Determine if any adapter has new data beyond stored watermarks.
+    
+    This prevents rerun storms by checking if there's actually new source data
+    before starting a rerun. Uses limit=1 for efficiency.
+    
+    Args:
+        request_id: Request identifier
+        adapters: List of adapters to check
+        watermarks: Dict mapping tool_name -> watermark datetime
+        dsn: Optional PostgreSQL DSN
+        
+    Returns:
+        Tuple of (has_new_data, tool_with_data)
+        - has_new_data: True if at least one adapter has new rows
+        - tool_with_data: Name of first tool with new data, or None
+    """
+    log = job_logger(__name__, tool="master", request_id=request_id, job_id="delta_check")
+    
+    for adapter in adapters:
+        tool_name = adapter.source_tool_name
+        
+        # Get watermark for this tool (None if not in dict)
+        watermark = watermarks.get(tool_name)
+        
+        try:
+            # Fetch exactly 1 row after watermark to check for new data
+            success, error, rows, _ = adapter.fetch_rows_after_watermark(
+                request_id=request_id,
+                watermark=watermark,
+                limit=1
+            )
+            
+            if not success:
+                log.warning(
+                    "MASTER_DELTA_CHECK_FETCH_FAILED | tool=%s | error=%s",
+                    tool_name,
+                    error
+                )
+                continue
+            
+            if rows and len(rows) > 0:
+                # Found new data!
+                log.info(
+                    "MASTER_DELTA_CHECK_HAS_DATA | tool=%s | watermark=%s | new_rows=1",
+                    tool_name,
+                    watermark.isoformat() if watermark else "None"
+                )
+                return True, tool_name
+            else:
+                log.debug(
+                    "MASTER_DELTA_CHECK_NO_DATA | tool=%s | watermark=%s | new_rows=0",
+                    tool_name,
+                    watermark.isoformat() if watermark else "None"
+                )
+        
+        except Exception as e:
+            log.warning(
+                "MASTER_DELTA_CHECK_ERROR | tool=%s | error=%s",
+                tool_name,
+                e
+            )
+            continue
+    
+    # No adapter has new data
+    log.info("MASTER_DELTA_CHECK_COMPLETE | has_new_data=false | checked_tools=%d", len(adapters))
+    return False, None
 
 
-@dataclass(frozen=True)
-class MasterMaps:
-    company_col: int
-    domain_col: int
-    website_col: int
-    location_col: int
-    query_source_col: int
-
-
-def _resolve_maps_for_tab(
-    tab_name: str,
-    *,
-    domain_col_map: dict[str, int],
-    column_map: dict[str, dict[str, int]],
-) -> MasterMaps:
-    t = (tab_name or "").strip()
-    cmap = column_map.get(t) or {}
-
-    domain_col = cmap.get("domain")
-    if domain_col is None:
-        domain_col = domain_col_map.get(t, 0)
-
-    return MasterMaps(
-        company_col=int(cmap.get("company", -1)),
-        domain_col=int(domain_col),
-        website_col=int(cmap.get("website", -1)),
-        location_col=int(cmap.get("location", -1)),
-        query_source_col=int(cmap.get("query_source", -1)),
-    )
-
-
-def run_master_job(
+def run_master_job_db_first_with_rerun(
     *,
     job_id: str,
-    plan: SearchPlan,
+    request_id: str,
     spreadsheet_id: str,
-    source_tabs: list[str],
-    domain_col_map: Optional[dict[str, int]] = None,
-    column_map: Optional[dict[str, dict[str, int]]] = None,
-    apply_formatting: bool = True,
-    hide_state_tab: bool = True,
-    hide_audit_tabs: bool = True,
-    reorder_tabs: bool = True,
-    linger_seconds: float = 3.0,
+    lock_conn: any,
+    source_tools: Optional[List[str]] = None,
+    window_size: int = 500,
     max_empty_passes: int = 10,
-    window_rows: int = 500,
-    max_total_appends: int = 5000,
-    # TEST MODE / CAPS
-    test_mode: bool = True,
-    reset_master_in_test_mode: bool = True,
-    max_rows_per_source: dict[str, int] | None = None,
-    max_passes: int | None = None,
+    linger_seconds: float = 3.0,
+    export_to_sheets: bool = True,
 ) -> None:
-    rid = (getattr(plan, "request_id", None) or "").strip()
+    """
+    Wrapper for run_master_job_db_first with level-trigger rerun logic.
+    
+    This function:
+    1. Runs Master once with the provided lock connection
+    2. After completion, checks pending flag
+    3. If pending, reruns Master (up to max_iterations for safety)
+    4. Always releases lock when done
+    
+    Args:
+        job_id: Job identifier
+        request_id: Request identifier
+        spreadsheet_id: Google Sheets spreadsheet ID
+        lock_conn: PostgreSQL connection holding the advisory lock
+        source_tools: Optional list of tool names to process
+        window_size: Number of rows to fetch per adapter per pass
+        max_empty_passes: Stop after this many passes with no new data
+        linger_seconds: Sleep between passes
+        export_to_sheets: Whether to export results to Sheets at end
+    """
+    from .orchestration import pop_pending, release_master_lock
+    
+    rid = norm(request_id)
     log = job_logger(__name__, tool="master", request_id=rid, job_id=job_id)
+    
+    max_reruns = 5  # Safety limit to prevent infinite loops
+    rerun_count = 0
+    
+    try:
+        while rerun_count <= max_reruns:
+            if rerun_count > 0:
+                log.info(
+                    "MASTER_RERUN | request_id=%s | rerun=%d/%d",
+                    rid,
+                    rerun_count,
+                    max_reruns
+                )
+            
+            # Run Master once
+            run_master_job_db_first(
+                job_id=job_id,
+                request_id=rid,
+                spreadsheet_id=spreadsheet_id,
+                lock_conn=lock_conn,
+                source_tools=source_tools,
+                window_size=window_size,
+                max_empty_passes=max_empty_passes,
+                linger_seconds=linger_seconds,
+                export_to_sheets=export_to_sheets,
+                _skip_lock_acquire=True,  # Lock already held
+            )
+            
+            # Check if pending flag was set during this run
+            was_pending = pop_pending(rid)
+            
+            if not was_pending:
+                # No pending triggers - we're done
+                log.info("MASTER_COMPLETE | request_id=%s | reruns=%d", rid, rerun_count)
+                break
+            
+            # Pending flag was set - perform delta check before rerunning
+            log.info(
+                "MASTER_POP_PENDING | was_pending=true | checking_delta=true | request_id=%s",
+                rid
+            )
+            
+            # Get available adapters for delta check
+            if source_tools:
+                adapters = []
+                for tool_name in source_tools:
+                    adapter = get_adapter_by_name(tool_name)
+                    if adapter and adapter.table_exists():
+                        adapters.append(adapter)
+            else:
+                adapters = [a for a in get_available_adapters() if a.table_exists()]
+            
+            if not adapters:
+                log.info(
+                    "MASTER_RERUN_SKIPPED | reason=no_adapters | request_id=%s",
+                    rid
+                )
+                break
+            
+            # Load current watermarks
+            watermark_repo = MasterWatermarkRepository()
+            success, error, watermarks = watermark_repo.get_watermarks_for_request(rid)
+            
+            if not success:
+                log.warning(
+                    "MASTER_WATERMARK_LOAD_FAILED | error=%s | proceeding_with_rerun",
+                    error
+                )
+                watermarks = {}
+            
+            # Perform delta check
+            has_new_data, tool_with_data = _has_new_data_after_watermarks(
+                request_id=rid,
+                adapters=adapters,
+                watermarks=watermarks
+            )
+            
+            if not has_new_data:
+                # No new data - check pending one more time to catch race condition
+                log.info(
+                    "MASTER_RERUN_SKIPPED | reason=no_new_rows_after_watermarks | request_id=%s",
+                    rid
+                )
+                
+                # Double-check: pop_pending again to catch any new triggers during delta check
+                was_pending_again = pop_pending(rid)
+                if was_pending_again:
+                    log.info(
+                        "MASTER_RERUN_RACE_DETECTED | request_id=%s | rechecking_delta",
+                        rid
+                    )
+                    # Re-check delta one more time
+                    has_new_data_retry, tool_with_data_retry = _has_new_data_after_watermarks(
+                        request_id=rid,
+                        adapters=adapters,
+                        watermarks=watermarks
+                    )
+                    if not has_new_data_retry:
+                        log.info(
+                            "MASTER_RERUN_SKIPPED_AFTER_DOUBLE_CHECK | reason=no_new_rows | request_id=%s",
+                            rid
+                        )
+                        break
+                    # Has new data after double-check - proceed with rerun
+                    tool_with_data = tool_with_data_retry
+                else:
+                    # No new pending and no new data - exit
+                    break
+            
+            # New data detected - proceed with rerun
+            log.info(
+                "MASTER_RERUN_CONFIRMED | reason=new_rows_detected | tool=%s | watermark=%s | request_id=%s",
+                tool_with_data or "unknown",
+                watermarks.get(tool_with_data).isoformat() if tool_with_data and watermarks.get(tool_with_data) else "None",
+                rid
+            )
+            
+            rerun_count += 1
+            
+            if rerun_count > max_reruns:
+                log.warning(
+                    "MASTER_MAX_RERUNS_REACHED | request_id=%s | max=%d",
+                    rid,
+                    max_reruns
+                )
+                break
+    
+    finally:
+        # Always release lock
+        release_master_lock(lock_conn, rid)
 
-    sheets: SheetsClient | None = None
-    sheets_mgr: GoogleSheetsManager | None = None
-    status: ToolStatusWriter | None = None
 
-    domain_col_map_eff = domain_col_map or DEFAULT_DOMAIN_COL_MAP
-    column_map_eff = column_map or DEFAULT_COLUMN_MAP
-
+def run_master_job_db_first(
+    *,
+    job_id: str,
+    request_id: str,
+    spreadsheet_id: str,
+    lock_conn: Optional[any] = None,
+    source_tools: Optional[List[str]] = None,
+    window_size: int = 500,
+    max_empty_passes: int = 10,
+    linger_seconds: float = 3.0,
+    export_to_sheets: bool = True,
+    _skip_lock_acquire: bool = False,
+) -> None:
+    """
+    Run DB-first Master ingestion job with advisory lock protection.
+    
+    This function:
+    1. Acquires PostgreSQL advisory lock (single-flight per request_id) unless _skip_lock_acquire
+    2. Validates inputs and marks job as running
+    3. Performs peek check: exits early if no data exists yet
+    4. Determines which tool adapters to run (auto-detect or explicit list)
+    5. For each adapter, fetches new rows using watermarks
+    6. Normalizes and upserts rows into master_results
+    7. Updates watermarks and Tool_Status
+    8. Stops when no new data or max empty passes reached
+    9. Optionally exports to Sheets at end
+    10. Releases advisory lock (unless _skip_lock_acquire)
+    
+    Design:
+    - Incremental: Processes data as it becomes available
+    - Idempotent: Safe to run multiple times
+    - Tool-agnostic: Works with any tool via adapters
+    - Concurrent-safe: Advisory lock prevents races
+    - Peek check: Avoids noisy runs before data exists
+    
+    Args:
+        job_id: Job identifier
+        request_id: Request identifier (required)
+        spreadsheet_id: Google Sheets spreadsheet ID
+        lock_conn: Optional lock connection (if already acquired)
+        source_tools: Optional list of tool names to process (e.g., ['HunterIO', 'GoogleMaps'])
+                     If None, auto-detects by checking for rows in source tables
+        window_size: Number of rows to fetch per adapter per pass
+        max_empty_passes: Stop after this many passes with no new data
+        linger_seconds: Sleep between passes (0 in test mode)
+        export_to_sheets: Whether to export results to Sheets at end
+        _skip_lock_acquire: Internal flag - skip lock acquisition (lock already held)
+    """
+    rid = norm(request_id)
+    if not rid:
+        raise ValueError("request_id is required")
+    
+    sid = norm(spreadsheet_id)
+    if not sid:
+        raise ValueError("spreadsheet_id is required")
+    
+    log = job_logger(__name__, tool="master", request_id=rid, job_id=job_id)
+    
+    # Acquire advisory lock to prevent concurrent Master runs for same request_id
+    from .orchestration import acquire_master_lock, release_master_lock
+    
+    if _skip_lock_acquire:
+        # Lock already acquired by wrapper function
+        if not lock_conn:
+            raise ValueError("lock_conn required when _skip_lock_acquire=True")
+    else:
+        # Acquire lock
+        lock_acquired, lock_conn_or_error = acquire_master_lock(rid)
+        
+        if not lock_acquired:
+            # Lock is busy or error occurred
+            if lock_conn_or_error is None:
+                # Lock is held by another Master process - this is normal
+                msg = "Master lock busy for this request_id - another Master is running"
+                log.info("MASTER_LOCK_BUSY | request_id=%s | skipping", rid)
+                mark_succeeded(job_id, message=msg, metrics={"skipped": True, "reason": "lock_busy"})
+            else:
+                # Error acquiring lock
+                msg = f"Failed to acquire Master lock: {lock_conn_or_error}"
+                log.error("MASTER_LOCK_ERROR | request_id=%s | error=%s", rid, lock_conn_or_error)
+                mark_failed(job_id, error=str(lock_conn_or_error), message=msg)
+            return
+        
+        # Lock acquired successfully - store connection to release later
+        lock_conn = lock_conn_or_error
+    
+    sheets: Optional[SheetsClient] = None
+    status: Optional[ToolStatusWriter] = None
+    
     try:
         mark_running(job_id)
-
-        sid = (spreadsheet_id or "").strip()
-        if not sid:
-            raise ValueError("spreadsheet_id must not be empty.")
-
+        
+        # Initialize Sheets client for Tool_Status updates
         sheets = SheetsClient(config=default_sheets_config(spreadsheet_id=sid))
-        sheets_mgr = GoogleSheetsManager(client=sheets)
         status = ToolStatusWriter(sheets=sheets, spreadsheet_id=sid)
-
-        # ---------------------------------------------------------------------
-        # Tabs + headers (test reset uses structural delete)
-        # ---------------------------------------------------------------------
-        if test_mode and reset_master_in_test_mode:
-            try:
-                sheets.delete_tab(tab_name=TAB_MASTER)
-            except Exception:
-                logger.exception("MASTER_TEST_RESET_DELETE_FAILED")
-
-        # Use manager setup for owned tabs: less read quota, more batching
-        # (We intentionally keep overwrite_headers_for_owned_tabs=True to avoid header reads.)
-        sheets_mgr.setup_tabs(
-            headers=[
-                (TAB_MASTER, MASTER_HEADERS),
-                (TAB_MASTER_STATE, STATE_HEADERS),
-            ],
-            hide_tabs=[TAB_MASTER_STATE] if hide_state_tab else [],
-            tab_order=[],
-            overwrite_headers_for_owned_tabs=True,
-            # Use a lightweight init marker to prevent repeated setup churn
-            # (In test mode, Master tab may be deleted each run; marker is still safe.)
-            init_marker_tab="Tool_Status" if not test_mode else "Master_State",
-            init_marker_cell="A1",
-        )
-
         status.ensure_ready()
-
-        # Optional: reorder/hide (kept from your logic)
-        if reorder_tabs:
-            try:
-                order = ["Tool_Status", "HunterIO", "GoogleMaps", "GoogleSearch", TAB_MASTER]
-                for idx, name in enumerate(order):
-                    sheets.move_tab(tab_name=name, index=idx)
-
-                if hide_audit_tabs:
-                    for t in ["HunterIO_Audit", "GoogleMaps_Audit", "GoogleSearch_Audit"]:
-                        sheets.hide_tab(tab_name=t)
-
-                if hide_state_tab:
-                    sheets.hide_tab(tab_name=TAB_MASTER_STATE)
-            except Exception:
-                logger.exception("MASTER_TAB_REORDER_FAILED")
-
-        cleaned_sources = [t.strip() for t in (source_tabs or []) if (t or "").strip()]
-        total_sources = len(cleaned_sources)
-
-        # Root-cause fix for "same N each run":
-        if test_mode and max_rows_per_source is None:
-            max_rows_per_source = dict(DEFAULT_TEST_CAPS)
-
-        if test_mode:
-            watermarks = {t: 1 for t in cleaned_sources}
+        
+        # Initialize repositories
+        results_repo = MasterResultsRepository()
+        watermark_repo = MasterWatermarkRepository()
+        
+        # Peek check: Determine which adapters to run and check if any have data
+        if source_tools:
+            # Explicit list provided
+            adapters = []
+            for tool_name in source_tools:
+                adapter = get_adapter_by_name(tool_name)
+                if adapter and adapter.table_exists():
+                    adapters.append(adapter)
+                    log.info("MASTER_ADAPTER_ENABLED | tool=%s | table=%s", tool_name, adapter.source_table_name)
+                else:
+                    log.warning("MASTER_ADAPTER_SKIPPED | tool=%s | reason=table_not_found", tool_name)
         else:
-            watermarks = _load_watermarks(sheets_mgr)
-
-        linger_s = 0.0 if test_mode else max(0.0, float(linger_seconds))
-        empty_cap = 1 if test_mode else max(0, int(max_empty_passes))
-
-        win = max(10, int(window_rows))
-        max_append_cap = max(1, int(max_total_appends))
-        caps_raw = {k.strip(): int(v) for (k, v) in (max_rows_per_source or {}).items() if (k or "").strip()}
-        caps = {t: caps_raw[t] for t in cleaned_sources if t in caps_raw}
-
-        update_progress(
-            job_id,
-            phase="master",
-            current=0,
-            total=total_sources,
-            message="Starting Master ingestion.",
-            metrics={
-                "sources": total_sources,
-                "test_mode": bool(test_mode),
-                "reset_master_in_test_mode": bool(reset_master_in_test_mode),
-                "linger_seconds": float(linger_s),
-                "max_empty_passes": int(empty_cap),
-                "window_rows": int(win),
-                "max_total_appends": int(max_append_cap),
-                "max_rows_per_source": caps,
-                "master_cols": len(MASTER_KEYS),
-            },
-        )
-
-        status.write(
-            job_id=job_id,
-            tool="master",
-            request_id=rid,
-            state="RUNNING",
-            phase="master",
-            current=0,
-            total=total_sources,
-            message="Starting Master ingestion.",
-            meta={
-                "sources": total_sources,
-                "test_mode": bool(test_mode),
-                "reset_master_in_test_mode": bool(reset_master_in_test_mode),
-                "linger_seconds": float(linger_s),
-                "max_empty_passes": int(empty_cap),
-                "window_rows": int(win),
-                "max_total_appends": int(max_append_cap),
-                "max_rows_per_source": caps,
-                "master_cols": len(MASTER_KEYS),
-            },
-        )
-
-        appended_total = 0
-        passes = 0
-        empty_passes = 0
-
-        appended_by_source: dict[str, int] = {t: 0 for t in cleaned_sources}
-        seen_domains_run: set[str] = set()
-
-        while appended_total < max_append_cap:
-            passes += 1
-            if max_passes is not None and passes > int(max_passes):
-                break
-
-            pass_appended = 0
-
-            for tab_name in cleaned_sources:
-                cap = caps.get(tab_name)
-                if cap is not None and appended_by_source.get(tab_name, 0) >= cap:
-                    continue
-
-                maps = _resolve_maps_for_tab(
-                    tab_name,
-                    domain_col_map=domain_col_map_eff,
-                    column_map=column_map_eff,
-                )
-
-                last_done = watermarks.get(tab_name, 1)
-                start_row = last_done + 1
-
-                remaining_cap = None
-                if cap is not None:
-                    remaining_cap = max(0, cap - appended_by_source.get(tab_name, 0))
-                    if remaining_cap <= 0:
-                        continue
-
-                read_rows = win if remaining_cap is None else min(win, max(1, remaining_cap))
-                end_row = start_row + read_rows - 1
-
-                # READS: budgeted by manager
-                block = sheets_mgr.read_range(tab_name=tab_name, a1_range=f"A{start_row}:Z{end_row}")
-
-                eff_n = _block_effective_rows(block)
-                if eff_n <= 0:
-                    continue
-
-                if remaining_cap is not None:
-                    eff_n = min(eff_n, remaining_cap)
-
-                master_rows: list[list[str]] = []
-                for r in block[:eff_n]:
-                    company = _safe_get(r, maps.company_col)
-                    domain = _safe_get(r, maps.domain_col)
-                    website = _safe_get(r, maps.website_col)
-                    location = _safe_get(r, maps.location_col)
-                    qsrc = _safe_get(r, maps.query_source_col)
-
-                    d_l = domain.lower().strip()
-                    dup = "YES" if d_l and d_l in seen_domains_run else "NO"
-                    if d_l:
-                        seen_domains_run.add(d_l)
-
-                    row_obj = {
-                        "company": company,
-                        "domain": domain,
-                        "website": website,
-                        "source_tool": tab_name,
-                        "location": location,
-                        "lead_query": qsrc,
-                        "dup_in_run": dup,
-                    }
-                    master_rows.append([row_obj.get(k, "") for k in MASTER_KEYS])
-
-                if master_rows:
-                    # WRITE: buffered append (one append per tab per flush)
-                    sheets_mgr.queue_append_rows(tab_name=TAB_MASTER, rows=master_rows)
-
-                    n_app = len(master_rows)
-                    appended_total += n_app
-                    pass_appended += n_app
-                    appended_by_source[tab_name] = appended_by_source.get(tab_name, 0) + n_app
-
-                # Watermarks
-                new_last = last_done + eff_n
-                watermarks[tab_name] = new_last
-
-                if not test_mode:
-                    # Persist watermark (bounded scan). Acceptable frequency: once per processed window.
-                    _write_watermark(sheets, source_tab=tab_name, last_row=new_last)
-
-                if appended_total >= max_append_cap:
-                    break
-
-            # Ensure buffered writes land periodically (and before formatting)
-            sheets_mgr.flush()
-
-            msg = (
-                f"Master pass={passes} appended_this_pass={pass_appended} "
-                f"appended_total={appended_total} empty_passes={empty_passes}/{empty_cap}"
-            )
-
-            update_progress(
-                job_id,
-                phase="master",
-                current=total_sources,
-                total=total_sources,
-                message=msg,
-                metrics={
-                    "passes": passes,
-                    "appended_total": appended_total,
-                    "empty_passes": empty_passes,
-                    "appended_by_source": dict(appended_by_source),
-                },
-            )
-
-            if STATUS_EVERY_N_PASSES and (passes % STATUS_EVERY_N_PASSES == 0) and status:
+            # Auto-detect: get all available adapters
+            adapters = [a for a in get_available_adapters() if a.table_exists()]
+        
+        # Peek check: Exit early if no data exists yet (avoids noisy runs)
+        if not adapters:
+            msg = "No source tools available"
+            log.info("MASTER_NO_ADAPTERS | request_id=%s | reason=no_tables", rid)
+            mark_succeeded(job_id, message=msg, metrics={"adapters": 0, "total_ingested": 0, "reason": "no_tables"})
+            if status:
                 status.write(
                     job_id=job_id,
                     tool="master",
                     request_id=rid,
-                    state="RUNNING",
+                    state="SUCCEEDED",
                     phase="master",
-                    current=appended_total,
-                    total=max_append_cap,
+                    current=0,
+                    total=0,
                     message=msg,
-                    meta={
-                        "passes": passes,
-                        "appended_total": appended_total,
-                        "empty_passes": empty_passes,
-                        "appended_by_source": dict(appended_by_source),
-                        "test_mode": bool(test_mode),
-                    },
+                    meta={},
+                    force=True,
                 )
-
-            if pass_appended == 0:
-                empty_passes += 1
-                if empty_cap == 0 or empty_passes >= empty_cap:
-                    break
-                if linger_s > 0:
-                    time.sleep(linger_s)
-            else:
-                empty_passes = 0
-
-        # Final flush to guarantee everything is written
-        sheets_mgr.flush()
-
-        # ---------------------------------------------------------------------
-        # Formatting (requested): layout + duplicate highlighting
-        # ---------------------------------------------------------------------
-        if apply_formatting and sheets:
-            try:
-                # NOTE: get_last_row reads a column; OK here since it's once at end.
-                last_row = sheets.get_last_row(tab_name=TAB_MASTER, signal_col=0)
-                if last_row < 2:
-                    last_row = 2
-
-                sheets.format_table_layout(
-                    tab_name=TAB_MASTER,
-                    n_cols=len(MASTER_KEYS),
-                    last_row=last_row,
-                    header_row=True,
-                    auto_resize=True,
-                    wrap_strategy_body="OVERFLOW_CELL",
+            return
+        
+        # Check if any adapter has data for this request
+        has_data = _has_data_for_request(rid, adapters)
+        
+        if not has_data:
+            msg = "No data found yet - tools haven't persisted data"
+            log.info("MASTER_NO_DATA_YET | request_id=%s | adapters=%d", rid, len(adapters))
+            mark_succeeded(job_id, message=msg, metrics={"adapters": len(adapters), "total_ingested": 0, "reason": "no_data_yet"})
+            if status:
+                status.write(
+                    job_id=job_id,
+                    tool="master",
+                    request_id=rid,
+                    state="SUCCEEDED",
+                    phase="master",
+                    current=0,
+                    total=0,
+                    message=msg,
+                    meta={"adapters": len(adapters)},
+                    force=True,
                 )
-
-                dup_idx = MASTER_KEYS.index("dup_in_run")
-                dup_letter = _col_index_to_a1(dup_idx)
-                formula = f'=${dup_letter}2="YES"'
-
-                sheet_id = sheets.get_sheet_id(TAB_MASTER)
-                if sheet_id is not None:
-                    rule = sheets.build_conditional_format_rule_custom_formula(
-                        sheet_id=sheet_id,
-                        start_row_index=1,
-                        start_col_index=0,
-                        end_col_index=len(MASTER_KEYS),
-                        end_row_index=last_row,
-                        formula=formula,
-                        background_rgb=(1.0, 0.85, 0.85),
+            return
+        
+        # Filter adapters to only those with data (for auto-detect mode)
+        if not source_tools:
+            adapters_with_data = []
+            for adapter in adapters:
+                success, error, rows, _ = adapter.fetch_rows_after_watermark(
+                    request_id=rid,
+                    watermark=None,
+                    limit=1
+                )
+                if success and rows:
+                    adapters_with_data.append(adapter)
+                    log.info(
+                        "MASTER_ADAPTER_AUTO_DETECTED | tool=%s | table=%s",
+                        adapter.source_tool_name,
+                        adapter.source_table_name
                     )
-                    sheets.replace_conditional_format_rules(tab_name=TAB_MASTER, rules=[rule])
-
-            except Exception:
-                logger.exception("MASTER_FORMATTING_FAILED")
-
-        msg = (
-            f"Master job completed. appended_total={appended_total} "
-            f"passes={passes} empty_passes={empty_passes}"
+            adapters = adapters_with_data
+        
+        if not adapters:
+            msg = "No adapters with data found"
+            log.info("MASTER_NO_ADAPTERS | request_id=%s | reason=no_data", rid)
+            mark_succeeded(job_id, message=msg, metrics={"adapters": 0, "total_ingested": 0, "reason": "no_data"})
+            if status:
+                status.write(
+                    job_id=job_id,
+                    tool="master",
+                    request_id=rid,
+                    state="SUCCEEDED",
+                    phase="master",
+                    current=0,
+                    total=0,
+                    message=msg,
+                    meta={},
+                    force=True,
+                )
+            return
+        
+        total_adapters = len(adapters)
+        log.info("MASTER_SINGLE_PASS_START | request_id=%s | adapters=%d | tools=%s", rid, total_adapters, [a.source_tool_name for a in adapters])
+        
+        update_progress(
+            job_id,
+            phase="master_ingestion",
+            current=0,
+            total=total_adapters,
+            message=f"Starting Master single-pass ingestion with {total_adapters} tools",
+            metrics={"adapters": total_adapters},
         )
-        if appended_total >= max_append_cap:
-            msg += " (stopped: max_total_appends reached)"
-        elif max_passes is not None and passes > int(max_passes):
-            msg += " (stopped: max_passes reached)"
-        elif empty_cap == 0 or empty_passes >= empty_cap:
-            msg += " (stopped: idle)"
-
-        mark_succeeded(job_id, message=msg, metrics={"appended_total": appended_total, "passes": passes})
+        
+        if status:
+            status.write(
+                job_id=job_id,
+                tool="master",
+                request_id=rid,
+                state="RUNNING",
+                phase="master_ingestion",
+                current=0,
+                total=total_adapters,
+                message=f"Starting Master single-pass ingestion with {total_adapters} tools",
+                meta={"adapters": total_adapters},
+            )
+        
+        # Track seen domains for duplicate detection within this run
+        seen_domains_run: Set[str] = set()
+        
+        # Track metrics per adapter
+        ingested_by_tool: dict[str, int] = {a.source_tool_name: 0 for a in adapters}
+        total_ingested = 0
+        
+        # Single-pass ingestion: process each adapter once
+        for adapter in adapters:
+            tool_name = adapter.source_tool_name
+            
+            # Get watermark for this tool
+            success, error, watermark_obj = watermark_repo.get_watermark(rid, tool_name)
+            if not success:
+                log.warning("MASTER_WATERMARK_GET_FAILED | tool=%s | error=%s", tool_name, error)
+                continue
+            
+            watermark = watermark_obj.last_seen_created_at if watermark_obj else None
+            
+            # Fetch ALL rows after watermark in single pass (no limit for single-pass mode)
+            success, error, source_rows, new_watermark = adapter.fetch_rows_after_watermark(
+                request_id=rid,
+                watermark=watermark,
+                limit=10000  # Large limit for single-pass - fetch all available data
+            )
+            
+            if not success:
+                log.warning("MASTER_FETCH_FAILED | tool=%s | error=%s", tool_name, error)
+                continue
+            
+            if not source_rows:
+                log.info("MASTER_NO_NEW_ROWS | tool=%s | watermark=%s", tool_name, watermark)
+                continue
+            
+            # Normalize rows to Master schema
+            master_rows: List[MasterRow] = []
+            skipped_rows = 0
+            no_domain_rows = 0
+            
+            for source_row in source_rows:
+                master_row = adapter.normalize_to_master(source_row)
+                if master_row:
+                    # Track no-domain rows (for GoogleMaps discover stage)
+                    if not master_row.domain or master_row.domain == "":
+                        no_domain_rows += 1
+                    
+                    # Compute duplicate flag (only for rows with domains)
+                    if master_row.domain:
+                        domain_lower = master_row.domain.lower().strip()
+                        if domain_lower in seen_domains_run:
+                            master_row.dup_in_run = "YES"
+                        else:
+                            master_row.dup_in_run = "NO"
+                            seen_domains_run.add(domain_lower)
+                    else:
+                        # No domain = not a duplicate (unique by place_id)
+                        master_row.dup_in_run = "NO"
+                    
+                    master_rows.append(master_row)
+                else:
+                    skipped_rows += 1
+            
+            if not master_rows:
+                log.debug("MASTER_NO_VALID_ROWS | tool=%s | fetched=%d | skipped=%d", tool_name, len(source_rows), skipped_rows)
+                continue
+            
+            if no_domain_rows > 0:
+                log.info("MASTER_NO_DOMAIN_ROWS | tool=%s | no_domain=%d | total=%d", tool_name, no_domain_rows, len(master_rows))
+            
+            # Upsert into master_results with fail-fast on permanent errors
+            try:
+                success, error, affected = results_repo.upsert_many(master_rows)
+                if not success:
+                    log.error("MASTER_UPSERT_FAILED | tool=%s | error=%s", tool_name, error)
+                    continue
+            except PermanentError as e:
+                # Schema/constraint error - fail immediately, don't retry
+                log.error("MASTER_PERMANENT_ERROR | tool=%s | error=%s | failing_fast", tool_name, e)
+                raise
+            
+            log.info(
+                "MASTER_INGESTED | tool=%s | rows=%d | affected=%d | new_watermark=%s",
+                tool_name,
+                len(master_rows),
+                affected,
+                new_watermark.isoformat() if new_watermark else "None"
+            )
+            
+            # Update watermark
+            if new_watermark:
+                success, error = watermark_repo.set_watermark(
+                    request_id=rid,
+                    source_tool=tool_name,
+                    last_seen_created_at=new_watermark,
+                    last_processed_count=len(master_rows)
+                )
+                if not success:
+                    log.warning("MASTER_WATERMARK_SET_FAILED | tool=%s | error=%s", tool_name, error)
+            
+            # Update metrics
+            ingested_by_tool[tool_name] += len(master_rows)
+            total_ingested += len(master_rows)
+            
+            # Update progress after each tool
+            update_progress(
+                job_id,
+                phase="master_ingestion",
+                current=total_ingested,
+                total=total_ingested,
+                message=f"Ingested {len(master_rows)} rows from {tool_name} (total: {total_ingested})",
+                metrics={
+                    "total_ingested": total_ingested,
+                    "by_tool": ingested_by_tool,
+                },
+            )
+        
+        log.info("MASTER_SINGLE_PASS_COMPLETE | request_id=%s | total_ingested=%d | tools=%s", rid, total_ingested, list(ingested_by_tool.keys()))
+        
+        # Export to Sheets only if data was ingested and export is enabled
+        if export_to_sheets and settings.master_sheets_export_enabled and total_ingested > 0:
+            log.info("MASTER_EXPORT_START | request_id=%s", rid)
+            
+            update_progress(
+                job_id,
+                phase="master_export",
+                current=0,
+                total=1,
+                message="Exporting Master results to Sheets",
+                metrics={"total_ingested": total_ingested},
+            )
+            
+            try:
+                from ..exports.sheets_exporter import export_master_results
+                
+                # Fetch results from DB
+                repo = MasterResultsRepository()
+                success, error, results = repo.get_results_by_request(request_id=rid)
+                
+                if not success:
+                    raise RuntimeError(f"Failed to fetch master results: {error}")
+                
+                if not results:
+                    log.warning("MASTER_EXPORT_NO_RESULTS | request_id=%s", rid)
+                else:
+                    # Convert results to Sheets format
+                    results_rows = _convert_results_to_sheets_format(results)
+                    
+                    # Create audit statistics
+                    audit_rows = _create_audit_rows(request_id=rid, results=results)
+                    
+                    # Export using centralized function
+                    export_master_results(
+                        client=sheets,
+                        job_id=job_id,
+                        request_id=rid,
+                        results_rows=results_rows,
+                        audit_rows=audit_rows,
+                    )
+                    
+                    log.info("MASTER_EXPORT_COMPLETE | request_id=%s | rows=%d", rid, len(results_rows))
+            except Exception as e:
+                log.error("MASTER_EXPORT_FAILED | error=%s", e, exc_info=True)
+                # Don't fail the job if export fails
+        
+        # Job succeeded
+        msg = f"Master single-pass ingestion completed. Ingested {total_ingested} rows from {len(ingested_by_tool)} tools."
+        mark_succeeded(
+            job_id,
+            message=msg,
+            metrics={
+                "total_ingested": total_ingested,
+                "by_tool": ingested_by_tool,
+                "adapters": total_adapters,
+                "single_pass": True,
+            }
+        )
+        
         log.info("JOB_SUCCEEDED | %s", msg)
-
+        
         if status:
             status.write(
                 job_id=job_id,
                 tool="master",
                 request_id=rid,
                 state="SUCCEEDED",
-                phase="master",
-                current=appended_total,
-                total=max_append_cap,
+                phase="master_complete",
+                current=total_ingested,
+                total=total_ingested,
                 message=msg,
                 meta={
-                    "appended_total": appended_total,
-                    "passes": passes,
-                    "empty_passes": empty_passes,
-                    "appended_by_source": dict(appended_by_source),
-                    "test_mode": bool(test_mode),
-                    "reset_master_in_test_mode": bool(reset_master_in_test_mode),
+                    "total_ingested": total_ingested,
+                    "by_tool": ingested_by_tool,
+                    "single_pass": True,
                 },
                 force=True,
             )
-
+    
     except Exception as exc:
-        mark_failed(job_id, error=str(exc), message="Master job failed.")
+        mark_failed(job_id, error=str(exc), message="Master job failed")
         log.exception("JOB_FAILED | error=%s", exc)
-
+        
         try:
             if status:
                 status.write(
@@ -570,10 +818,15 @@ def run_master_job(
                     state="FAILED",
                     phase="master",
                     current=0,
-                    total=len(source_tabs or []),
+                    total=0,
                     message=str(exc),
                     meta={},
                     force=True,
                 )
         except Exception:
             logger.exception("TOOL_STATUS_WRITE_FAILED")
+    
+    finally:
+        # Release the advisory lock only if we acquired it
+        if not _skip_lock_acquire and lock_conn:
+            release_master_lock(lock_conn, rid)
