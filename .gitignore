@@ -123,3 +123,4 @@ FROM
 test_domains.txt
 test_env_loading.py
 test_multiple_domains.py
+psql/
