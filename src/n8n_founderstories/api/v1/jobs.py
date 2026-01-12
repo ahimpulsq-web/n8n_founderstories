@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ...services.jobs.store import load_job
+from ...core.errors import validate_job_exists
 
 router = APIRouter()
 
@@ -33,8 +34,7 @@ class JobStatusResponse(BaseModel):
 @router.get("/jobs/{job_id}", response_model=JobStatusResponse, tags=["jobs"])
 async def get_job_status(job_id: str) -> JobStatusResponse:
     job = load_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found.")
+    validate_job_exists(job_id, job)
 
     return JobStatusResponse(
         job_id=job.job_id,

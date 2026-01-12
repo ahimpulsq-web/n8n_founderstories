@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from .api.v1 import router as api_v1_router
 from .core.config import settings
 from .core.logging import setup_logging
+from .core.errors import global_exception_handler, ErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ def create_app() -> FastAPI:
 # -------------------------------------------------------------------------
 def _register_exception_handlers(app: FastAPI) -> None:
     """Register global exception handlers."""
+    from datetime import datetime, timezone
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
@@ -53,17 +55,18 @@ def _register_exception_handlers(app: FastAPI) -> None:
             request.url.path,
             exc.errors(),
         )
-        return JSONResponse(status_code=422, content={"detail": exc.errors()})
-
-    @app.exception_handler(Exception)
-    async def global_exception_handler(
-        request: Request, exc: Exception
-    ) -> JSONResponse:
-        logger.exception("UNHANDLED_EXCEPTION | path=%s", request.url.path)
         return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal server error. Please try again later."},
+            status_code=422,
+            content={
+                "detail": "Request validation failed. Please check your input.",
+                "error_code": ErrorCode.VALIDATION_INVALID_FORMAT.value,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "validation_errors": exc.errors()
+            }
         )
+
+    # Use our centralized exception handler
+    app.add_exception_handler(Exception, global_exception_handler)
 
 
 def _register_routes(app: FastAPI) -> None:

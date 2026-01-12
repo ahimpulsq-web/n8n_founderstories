@@ -16,6 +16,12 @@ from fastapi import HTTPException
 
 from ...core.config import settings
 from ...core.utils.text import norm
+from ...core.errors import (
+    MissingAPIKeyError,
+    RequiredFieldError,
+    require_api_key,
+    require_field
+)
 
 
 # ============================================================================
@@ -24,14 +30,12 @@ from ...core.utils.text import norm
 
 def require_serpapi_key() -> None:
     """Ensure SerpAPI is configured for endpoints that depend on it."""
-    if not settings.serpapi_api_key:
-        raise HTTPException(status_code=500, detail="SERPAPI_API_KEY is not configured.")
+    require_api_key("SerpAPI", "SERPAPI_API_KEY", settings.serpapi_api_key)
 
 
 def require_google_maps_key() -> None:
     """Ensure Google Maps is configured for endpoints that depend on it."""
-    if not settings.google_maps_api_key:
-        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY is not configured.")
+    require_api_key("Google Maps", "GOOGLE_MAPS_API_KEY", settings.google_maps_api_key)
 
 
 # ============================================================================
@@ -49,12 +53,9 @@ def require_search_plan(plan: Any) -> None:
     raw_prompt = getattr(plan, "raw_prompt", None)
     provider_name = getattr(plan, "provider_name", None)
 
-    if not request_id or not str(request_id).strip():
-        raise HTTPException(status_code=400, detail="search_plan.request_id is required.")
-    if not raw_prompt or not str(raw_prompt).strip():
-        raise HTTPException(status_code=400, detail="search_plan.raw_prompt must not be empty.")
-    if not provider_name or not str(provider_name).strip():
-        raise HTTPException(status_code=400, detail="search_plan.provider_name is required.")
+    require_field("request_id", request_id, "search_plan.request_id")
+    require_field("raw_prompt", raw_prompt, "search_plan.raw_prompt")
+    require_field("provider_name", provider_name, "search_plan.provider_name")
 
 
 def require_spreadsheet_fields(spreadsheet_id: str | None, sheet_title: str | None) -> tuple[str, str]:
@@ -62,10 +63,8 @@ def require_spreadsheet_fields(spreadsheet_id: str | None, sheet_title: str | No
     sid = norm(spreadsheet_id)
     st = norm(sheet_title)
 
-    if not sid:
-        raise HTTPException(status_code=400, detail="spreadsheet_id must not be empty.")
-    if not st:
-        raise HTTPException(status_code=400, detail="sheet_title must not be empty.")
+    require_field("spreadsheet_id", sid)
+    require_field("sheet_title", st)
 
     return sid, st
 

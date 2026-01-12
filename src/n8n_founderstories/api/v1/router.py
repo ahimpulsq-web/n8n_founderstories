@@ -10,7 +10,7 @@ from fastapi import APIRouter
 from .prompt import router as prompt_router
 from .jobs import router as jobs_router
 from .master import router as master_router
-from .email_extractor import router as email_extractor_router
+from .web_scraper import router as company_data_extractor_router
 
 
 from .google_maps import router as google_maps_router
@@ -27,4 +27,4 @@ router.include_router(google_maps_router, tags=["location"])
 router.include_router(hunter_router, tags=["enrichment"])
 router.include_router(google_search_router, tags=["google_search"])
 router.include_router(master_router, tags=["master"])
-router.include_router(email_extractor_router, tags=["web_scrapper"])
+router.include_router(company_data_extractor_router, tags=["web_scrapper"])

@@ -171,6 +171,219 @@ class Settings(BaseSettings):
         description="OAuth scopes for Google Sheets/Drive.",
     )
 
+    # -------------------------------------------------------------------------
+    # Google Sheets formatting settings
+    # -------------------------------------------------------------------------
+    google_sheets_header_row_height: int = Field(
+        default=30,
+        ge=15,
+        le=100,
+        description="Header row height in pixels (15-100).",
+    )
+    google_sheets_body_row_height: int = Field(
+        default=21,
+        ge=15,
+        le=50,
+        description="Body row height in pixels (15-50).",
+    )
+    google_sheets_wrap_strategy: str = Field(
+        default="CLIP",
+        description="Text wrap strategy for body cells: CLIP, OVERFLOW_CELL, or WRAP.",
+    )
+
+    # -------------------------------------------------------------------------
+    # PostgreSQL Database Configuration
+    # -------------------------------------------------------------------------
+    postgres_host: str = Field(
+        default="localhost",
+        description="PostgreSQL host (POSTGRES_HOST).",
+    )
+    postgres_port: int = Field(
+        default=5432,
+        description="PostgreSQL port (POSTGRES_PORT).",
+    )
+    postgres_database: str = Field(
+        default="n8n_founderstories",
+        description="PostgreSQL database name (POSTGRES_DATABASE).",
+    )
+    postgres_username: str = Field(
+        default="postgres",
+        description="PostgreSQL username (POSTGRES_USERNAME).",
+    )
+    postgres_password: str = Field(
+        default="",
+        description="PostgreSQL password (POSTGRES_PASSWORD).",
+    )
+    
+    # Connection pool settings
+    postgres_min_connections: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Minimum database connections in pool.",
+    )
+    postgres_max_connections: int = Field(
+        default=20,
+        ge=5,
+        le=100,
+        description="Maximum database connections in pool.",
+    )
+    postgres_pool_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description="Connection pool timeout in seconds.",
+    )
+    
+    # SSL and debugging
+    postgres_ssl_mode: str = Field(
+        default="prefer",
+        description="PostgreSQL SSL mode (disable, allow, prefer, require).",
+    )
+    postgres_echo_sql: bool = Field(
+        default=False,
+        description="Echo SQL queries to logs (development only).",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Database Migration and Hybrid Mode Settings
+    # -------------------------------------------------------------------------
+    enable_postgres: bool = Field(
+        default=True,
+        description="Enable PostgreSQL integration (ENABLE_POSTGRES).",
+    )
+    hybrid_mode: bool = Field(
+        default=True,
+        description="Run in hybrid mode (both Sheets and PostgreSQL).",
+    )
+    postgres_primary: bool = Field(
+        default=True,
+        description="Use PostgreSQL as primary storage (Sheets is export/view layer).",
+    )
+    
+    # Data synchronization settings
+    sync_to_sheets: bool = Field(
+        default=True,
+        description="Export PostgreSQL data to Google Sheets (DB→Sheets).",
+    )
+    sync_interval_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=1440,
+        description="Sync interval in minutes for hybrid mode.",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Database Feature Flags (safe-by-default)
+    # -------------------------------------------------------------------------
+    postgres_dsn: str | None = Field(
+        default=None,
+        description="Full PostgreSQL connection string (POSTGRES_DSN). If not provided, will be built from individual postgres_* fields.",
+    )
+    
+    hunter_companies_db_enabled: bool = Field(
+        default=False,
+        description="Enable Hunter.io companies database writes (HUNTER_COMPANIES_DB_ENABLED).",
+    )
+    hunter_audit_db_enabled: bool = Field(
+        default=False,
+        description="Enable Hunter.io audit database writes (HUNTER_AUDIT_DB_ENABLED).",
+    )
+    google_maps_results_db_enabled: bool = Field(
+        default=False,
+        description="Enable Google Maps results database writes (GOOGLE_MAPS_RESULTS_DB_ENABLED).",
+    )
+    google_maps_enriched_db_enabled: bool = Field(
+        default=False,
+        description="Enable Google Maps enriched database writes (GOOGLE_MAPS_ENRICHED_DB_ENABLED).",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Hunter.io Configuration
+    # -------------------------------------------------------------------------
+    hunter_sheets_export_enabled: bool = Field(
+        default=True,
+        description="Enable Hunter.io results export to Google Sheets (HUNTER_SHEETS_EXPORT_ENABLED).",
+    )
+    hunter_sheets_live_append_enabled: bool = Field(
+        default=False,
+        description="Enable live append to Google Sheets during Hunter.io discovery (HUNTER_SHEETS_LIVE_APPEND_ENABLED).",
+    )
+    hunter_db_batch_size_results: int = Field(
+        default=200,
+        ge=50,
+        le=1000,
+        description="Batch size for Hunter.io results database writes.",
+    )
+    hunter_db_batch_size_audit: int = Field(
+        default=50,
+        ge=10,
+        le=200,
+        description="Batch size for Hunter.io audit database writes.",
+    )
+    google_maps_db_batch_size_results: int = Field(
+        default=200,
+        ge=50,
+        le=1000,
+        description="Batch size for Google Maps results database writes.",
+    )
+    google_maps_db_batch_size_enriched: int = Field(
+        default=100,
+        ge=25,
+        le=500,
+        description="Batch size for Google Maps enriched database writes.",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Google Maps Configuration
+    # -------------------------------------------------------------------------
+    google_maps_sheets_export_enabled: bool = Field(
+        default=True,
+        description="Enable Google Maps results export to Google Sheets (GOOGLE_MAPS_SHEETS_EXPORT_ENABLED).",
+    )
+    google_maps_sheets_live_append_enabled: bool = Field(
+        default=False,
+        description="Enable live append to Google Sheets during Google Maps discovery (GOOGLE_MAPS_SHEETS_LIVE_APPEND_ENABLED).",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Master Data Configuration
+    # -------------------------------------------------------------------------
+    master_sheets_export_enabled: bool = Field(
+        default=True,
+        description="Enable Master results export to Google Sheets at job end (MASTER_SHEETS_EXPORT_ENABLED).",
+    )
+    
+    # -------------------------------------------------------------------------
+    # Computed properties
+    # -------------------------------------------------------------------------
+    
+    def get_postgres_dsn(self) -> str | None:
+        """
+        Get PostgreSQL DSN, building it from components if not directly provided.
+        
+        Priority:
+        1. Use postgres_dsn if explicitly set
+        2. Build from postgres_host, postgres_port, postgres_database, postgres_username, postgres_password
+        3. Return None if password is empty (indicates incomplete configuration)
+        
+        Returns:
+            PostgreSQL connection string or None if not configured
+        """
+        # If explicit DSN provided, use it
+        if self.postgres_dsn:
+            return self.postgres_dsn
+        
+        # Build from components only if password is set (indicates intentional configuration)
+        if not self.postgres_password:
+            return None
+        
+        # Build DSN from individual components
+        return (
+            f"postgresql://{self.postgres_username}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
+        )
+
 
 # Singleton settings object used throughout the application.
 settings = Settings()

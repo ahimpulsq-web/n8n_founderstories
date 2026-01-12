@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from ...core.utils.text import norm
 from ...services.jobs.store import create_job
 from ...services.search_plan import SearchPlan
-from ...services.web_scrapers.email_extractor.runner import run_email_extractor_job
+from ...services.web_scrapers.company_data_extractor.runner import run_email_extractor_job
 from .deps import require_search_plan
 
 router = APIRouter()
@@ -35,7 +35,7 @@ class EmailExtractorJobResponse(BaseModel):
     request_id: str
 
 
-@router.post("/email_extractor/jobs", response_model=EmailExtractorJobResponse, tags=["web_scrapper"])
+@router.post("/company_data_extractor/jobs", response_model=EmailExtractorJobResponse, tags=["web_scrapper"])
 async def start_email_extractor_job(
     payload: EmailExtractorJobRequest,
     background_tasks: BackgroundTasks,

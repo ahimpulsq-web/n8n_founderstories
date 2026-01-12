@@ -10,9 +10,10 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from ...core.utils.text import norm
+from ...core.errors import require_field
 from ...services.jobs.store import create_job
 from ...services.search_plan import SearchPlan
-from ...services.master_data.runner import run_master_job
+from ...services.master_data.runner import run_master_job_db_first
 
 router = APIRouter()
 
@@ -22,30 +23,37 @@ class MasterJobRequest(BaseModel):
     search_plan: SearchPlan = Field(..., description="SearchPlan passed from n8n.")
     spreadsheet_id: str = Field(..., description="Target Google Spreadsheet ID.")
 
-    # Optional controls
-    source_tabs: list[str] = Field(
-        default_factory=lambda: ["HunterIO", "GoogleMaps", "GoogleSearch"],
-        description="Tabs to ingest into Master.",
-    )
-
-    # Optional mapping overrides (defaults applied in runner if omitted)
-    domain_col_map: dict[str, int] | None = Field(
+    # Optional controls (DB-first)
+    source_tools: list[str] | None = Field(
         default=None,
-        description="Per-tab 0-based domain column index override. Example: {'HunterIO': 0}.",
+        description="Tool names to process (e.g., ['HunterIO', 'GoogleMaps']). If None, auto-detects.",
     )
-    column_map: dict[str, dict[str, int]] | None = Field(
-        default=None,
-        description=(
-            "Per-tab 0-based column mapping override. Example: "
-            "{'HunterIO': {'domain': 0, 'company': 1}, 'GoogleMaps': {'domain': 6, 'company': 0}}"
-        ),
+    
+    # Ingestion parameters
+    window_size: int = Field(
+        default=500,
+        ge=10,
+        le=2000,
+        description="Number of rows to fetch per adapter per pass.",
     )
-
-    # Behavior flags
-    apply_formatting: bool = Field(default=True)
-    hide_state_tab: bool = Field(default=True, description="Hide Master_State tab.")
-    hide_audit_tabs: bool = Field(default=True, description="Hide *_Audit tabs if present.")
-    reorder_tabs: bool = Field(default=True)
+    max_empty_passes: int = Field(
+        default=10,
+        ge=1,
+        le=100,
+        description="Stop after this many passes with no new data.",
+    )
+    linger_seconds: float = Field(
+        default=3.0,
+        ge=0.0,
+        le=60.0,
+        description="Sleep between passes (0 in test mode).",
+    )
+    
+    # Export control
+    export_to_sheets: bool = Field(
+        default=True,
+        description="Whether to export results to Sheets at job end.",
+    )
 
 
 class MasterJobResponse(BaseModel):
@@ -56,21 +64,30 @@ class MasterJobResponse(BaseModel):
 
 @router.post("/master/jobs", response_model=MasterJobResponse, tags=["master"])
 async def start_master_job(payload: MasterJobRequest, background_tasks: BackgroundTasks) -> MasterJobResponse:
+    """
+    Start a DB-first Master ingestion job.
+    
+    This endpoint:
+    - Reads from tool DB tables (Hunter, Google Maps, etc.)
+    - Aggregates results into master_results with idempotent upserts
+    - Tracks watermarks for incremental ingestion
+    - Optionally exports to Sheets at job end
+    """
     plan = payload.search_plan
 
+    # Validate required fields using centralized error handling
     rid = norm(getattr(plan, "request_id", None))
-    if not rid:
-        raise HTTPException(status_code=400, detail="search_plan.request_id must not be empty.")
+    require_field("request_id", rid, "search_plan.request_id")
 
     sid = norm(payload.spreadsheet_id)
-    if not sid:
-        raise HTTPException(status_code=400, detail="spreadsheet_id must not be empty.")
-
-    source_tabs = [norm(t) for t in (payload.source_tabs or []) if norm(t)]
-    if not source_tabs:
-        raise HTTPException(status_code=400, detail="source_tabs must not be empty.")
+    require_field("spreadsheet_id", sid)
 
     job_id = f"master_{uuid4().hex}"
+
+    # Normalize source_tools if provided
+    source_tools = None
+    if payload.source_tools:
+        source_tools = [norm(t) for t in payload.source_tools if norm(t)]
 
     create_job(
         job_id=job_id,
@@ -78,28 +95,25 @@ async def start_master_job(payload: MasterJobRequest, background_tasks: Backgrou
         request_id=rid,
         meta={
             "spreadsheet_id": sid,
-            "source_tabs": source_tabs,
-            "apply_formatting": payload.apply_formatting,
-            "hide_state_tab": payload.hide_state_tab,
-            "hide_audit_tabs": payload.hide_audit_tabs,
-            "reorder_tabs": payload.reorder_tabs,
-            "domain_col_map": payload.domain_col_map,
-            "column_map": payload.column_map,
+            "source_tools": source_tools,
+            "window_size": payload.window_size,
+            "max_empty_passes": payload.max_empty_passes,
+            "linger_seconds": payload.linger_seconds,
+            "export_to_sheets": payload.export_to_sheets,
+            "db_first": True,  # Flag to indicate DB-first architecture
         },
     )
 
     background_tasks.add_task(
-        run_master_job,
+        run_master_job_db_first,
         job_id=job_id,
-        plan=plan,
+        request_id=rid,
         spreadsheet_id=sid,
-        source_tabs=source_tabs,
-        domain_col_map=payload.domain_col_map,
-        column_map=payload.column_map,
-        apply_formatting=payload.apply_formatting,
-        hide_state_tab=payload.hide_state_tab,
-        hide_audit_tabs=payload.hide_audit_tabs,
-        reorder_tabs=payload.reorder_tabs,
+        source_tools=source_tools,
+        window_size=payload.window_size,
+        max_empty_passes=payload.max_empty_passes,
+        linger_seconds=payload.linger_seconds,
+        export_to_sheets=payload.export_to_sheets,
     )
 
     return MasterJobResponse(status="accepted", job_id=job_id, request_id=rid)
