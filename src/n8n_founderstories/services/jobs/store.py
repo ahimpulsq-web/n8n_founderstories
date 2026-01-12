@@ -257,6 +257,41 @@ def load_latest_job(*, tool: str | None = None) -> JobRecord | None:
     return load_job(jid)
 
 
+def find_job_by_request_and_tool(*, request_id: str, tool: str) -> JobRecord | None:
+    """
+    Find the most recent job for a given request_id and tool.
+    
+    This scans the jobs store to find jobs matching both criteria.
+    Useful for checking if source jobs are still running.
+    """
+    rid = norm(request_id)
+    t = slugify(norm(tool)) or "unknown"
+    if not rid:
+        return None
+    
+    with _STORE_LOCK:
+        store = _read_json_file(_jobs_store_path())
+    
+    # Find all jobs matching request_id and tool, return the most recent
+    matching: list[tuple[JobRecord, datetime]] = []
+    for job_data in store.values():
+        if not isinstance(job_data, dict):
+            continue
+        try:
+            job = JobRecord.model_validate(job_data)
+            if job.request_id == rid and job.tool == t:
+                matching.append((job, job.updated_at))
+        except Exception:
+            continue
+    
+    if not matching:
+        return None
+    
+    # Return the most recently updated job
+    matching.sort(key=lambda x: x[1], reverse=True)
+    return matching[0][0]
+
+
 def mark_running(job_id: str) -> JobRecord:
     job = _require_job(job_id)
     job.state = JobState.RUNNING

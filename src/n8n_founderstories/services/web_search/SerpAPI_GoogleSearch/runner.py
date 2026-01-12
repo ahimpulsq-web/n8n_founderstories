@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 from ....core.utils.text import norm
 from ....services.exports.sheets import SheetsClient, default_sheets_config
 from ....services.exports.sheets_manager import GoogleSheetsManager
+from ....services.exports.sheets_schema import TAB_STATUS
 from ....services.jobs.logging import job_logger
 from ....services.jobs.sheets_status import ToolStatusWriter
 from ....services.jobs.store import mark_failed, mark_running, mark_succeeded, update_progress
@@ -19,6 +20,9 @@ from .models import GoogleSearchJobResult, GoogleSearchRunResult
 
 logger = logging.getLogger(__name__)
 
+# Note: TAB_STATUS imported from sheets_schema.py
+# Note: GoogleSearch and GoogleSearch_Audit tabs should be created at export time
+# For now, keeping legacy behavior but marking for future refactor
 TAB_MAIN = "GoogleSearch"
 TAB_AUDIT = "GoogleSearch_Audit"
 COL_KEY = 0
@@ -231,18 +235,22 @@ def run_google_search_job(
         gsm = GoogleSheetsManager(client=sheets)
         status = ToolStatusWriter(sheets=sheets, spreadsheet_id=sid, manager=gsm)
 
-        sheets.ensure_tab("Tool_Status")
+        # Only create Tool_Status tab at runtime (exception to export-only rule)
+        sheets.ensure_tab(TAB_STATUS)
+        
+        # TODO: Refactor to export-only pattern like Google Maps and Hunter
+        # For now, keeping legacy behavior for GoogleSearch tabs
         sheets.ensure_tab(TAB_MAIN)
         sheets.ensure_tab(TAB_AUDIT)
 
         gsm.setup_tabs(
             headers=[
-                ("Tool_Status", status.header()),
+                (TAB_STATUS, status.header()),
                 (TAB_MAIN, HEADERS_MAIN),
                 (TAB_AUDIT, HEADERS_AUDIT),
             ],
             hide_tabs=[TAB_AUDIT],
-            tab_order=["Tool_Status", "HunterIO", "HunterIO_Audit", "GoogleMaps", "GoogleMaps_Audit", TAB_MAIN, TAB_AUDIT],
+            tab_order=[TAB_STATUS, "HunterIO_v2", "HunterIO_Audit_v2", "GoogleMaps_v2", "GoogleMaps_Audit_v2", TAB_MAIN, TAB_AUDIT],
             overwrite_headers_for_owned_tabs=True,
         )
 
@@ -500,6 +508,24 @@ def run_google_search_job(
             )
         if gsm:
             gsm.flush()
+        
+        # Trigger Master ingestion after successful completion
+        try:
+            from ....services.master_data.orchestration import trigger_master_job
+            
+            success, error, master_job_id = trigger_master_job(
+                request_id=rid,
+                spreadsheet_id=sid,
+                source_tool="google_search"
+            )
+            
+            if success:
+                log.info("MASTER_TRIGGERED | master_job_id=%s", master_job_id)
+            else:
+                log.warning("MASTER_TRIGGER_FAILED | error=%s", error)
+        except Exception as e:
+            log.error("MASTER_TRIGGER_ERROR | error=%s", e, exc_info=True)
+            # Don't fail the Google Search job if Master trigger fails
 
     except Exception as exc:
         if gsm:

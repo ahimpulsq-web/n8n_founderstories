@@ -23,3 +23,103 @@ dist/
 build/
 __pycache__/
 *.pyc
+
+# =========================
+# OS / IDE
+# =========================
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+.idea/
+.vscode/
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+*.swp
+*.swo
+
+# =========================
+# Python tooling / caches
+# =========================
+.pytest_cache/
+.mypy_cache/
+.pytype/
+.pyre/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# =========================
+# Virtualenvs
+# =========================
+.venv/
+env/
+ENV/
+venv.bak/
+
+# =========================
+# Build / packaging
+# =========================
+*.whl
+pip-wheel-metadata/
+
+# =========================
+# Logs / dumps
+# =========================
+*.log
+logs/
+*.out
+*.dump
+*.sql.gz
+*.tar
+*.bak
+
+# =========================
+# Repo-specific generated artifacts
+# =========================
+code-map.html
+src.zip
+psql/
+test_results/
+n8n-*.json
+
+# =========================
+# Credentials / keys
+# =========================
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+*.jks
+credentials.json
+client_secret*.json
+token.json
+
+# Optional: ignore most root-level design notes (keep docs/ instead)
+*_SUMMARY.md
+*_IMPLEMENTATION*.md
+DB_FIRST_*.md
+MASTER_*.md
+GOOGLE_MAPS_*.md
+SHEETS_*.md
+REFACTORING_SUMMARY.md
+IMPLEMENTATION_SUMMARY.md
+TOOL_STATUS_FIX_SUMMARY.md
+
+
+# Local tooling / scratch
+psql/
+FROM
+
+# Ad-hoc local tests at repo root
+test_domains.txt
+test_env_loading.py
+test_multiple_domains.py
