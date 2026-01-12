@@ -124,3 +124,19 @@ test_domains.txt
 test_env_loading.py
 test_multiple_domains.py
 psql/
+
+
+# =========================
+# Temporary cleanup / local-only
+# =========================
+
+CODE_MAP_GUIDE.md
+docs/
+psql/
+scripts/
+
+# Examples / refactors
+src/n8n_founderstories/services/outreach/hunterio/runner_refactored_example.py
+
+# Tests (temporary ignore – re-enable later)
+tests/
