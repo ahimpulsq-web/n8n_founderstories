@@ -6,8 +6,10 @@ from itertools import combinations
 from typing import Any
 
 from ....core.utils.text import norm
+from ....core.config import settings
 from ....services.exports.sheets import SheetsClient, default_sheets_config
-from ....services.exports.sheets_manager import GoogleSheetsManager
+from ....services.exports.sheets_exporter import export_hunter_results
+from ....services.exports.sheets_schema import TAB_STATUS
 from ....services.jobs.logging import job_logger
 from ....services.jobs.sheets_status import ToolStatusWriter
 from ....services.jobs.store import mark_failed, mark_running, mark_succeeded, update_progress
@@ -15,8 +17,19 @@ from ....services.search_plan import SearchPlan
 from ....services.storage import save_enrichment_output
 from .client import HunterClient
 from .models import HunterCompany, HunterJobResult, HunterQueryType, HunterRunResult
+from .repos import (
+    HunterIOBatchProcessor,
+    HunterIOResultRow,
+    HunterIOResultsRepository,
+    HunterAuditRepository,
+    convert_db_results_to_sheets_format,
+    convert_db_audit_to_sheets_format
+)
 
 logger = logging.getLogger(__name__)
+
+# Note: TAB_STATUS imported from sheets_schema.py
+# Note: HunterIO_v2 and HunterIO_Audit_v2 tabs are created only at export time
 
 HEADCOUNT_BUCKETS: list[str] = [
     "1-10",
@@ -29,48 +42,19 @@ HEADCOUNT_BUCKETS: list[str] = [
     "10001+",
 ]
 
-HUNTER_TAB_MAIN = "HunterIO"
-HUNTER_HEADERS_MAIN = [
-    "Domain",
-    "Organisation",
-    "Location (Applied)",
-    "Headcount Bucket (Applied)",
-    "Location (Intended)",
-    "Headcount Bucket (Intended)",
-    "Source Query",
-    "Query Type",
-]
-HUNTER_DOMAIN_KEY_COL = 0
-
-HUNTER_TAB_AUDIT = "HunterIO_Audit"
-HUNTER_HEADERS_AUDIT = [
-    "Job ID",
-    "Request ID",
-    "Query Type",
-    "Intended Location",
-    "Intended Headcount",
-    "Applied Location",
-    "Applied Headcount",
-    "Query Text",
-    "Keywords",
-    "Keyword Match",
-    "Total Results",
-    "Returned Count",
-    "Appended Rows",
-    "Applied Filters (JSON)",
-]
+# Legacy constants - kept for backward compatibility but not used for new exports
+# New exports use constants from sheets_schema.py
+HUNTER_DOMAIN_KEY_COL = 1  # Domain is column 1 (0-indexed)
 
 
 def _company_to_row(c: HunterCompany) -> list[str]:
     return [
-        norm(c.domain),
-        norm(c.organization),
-        norm(c.location),
-        norm(c.headcount_bucket),
-        norm(getattr(c, "intended_location", None)),
-        norm(getattr(c, "intended_headcount_bucket", None)),
-        norm(c.source_query),
-        c.query_type.value if c.query_type else "",
+        norm(c.organization),  # Organisation (first column in new format)
+        norm(c.domain),        # Domain (second column in new format)
+        norm(c.location),      # Location
+        norm(c.headcount_bucket),  # Headcount
+        norm(c.source_query),  # Search Query
+        f"{norm(getattr(c, 'intended_location', None))} | {norm(getattr(c, 'intended_headcount_bucket', None))}",  # Debug Filters
     ]
 
 
@@ -190,6 +174,7 @@ def run_hunter_job(
     sheets: SheetsClient | None = None
     gsm: GoogleSheetsManager | None = None
     status: ToolStatusWriter | None = None
+    batch_processor: HunterIOBatchProcessor | None = None
 
     last_msg = "Starting Hunter discovery."
 
@@ -232,27 +217,13 @@ def run_hunter_job(
         if not locations:
             raise ValueError("search_plan.geo_location_keywords is missing/invalid; cannot build headquarters_location.")
 
-        # Sheets + Manager + Status
+        # Initialize batch processor for DB-first approach
+        batch_processor = HunterIOBatchProcessor(job_id=job_id, request_id=rid)
+
+        # Initialize sheets client - only for Tool_Status (exception to export-only rule)
         sheets = SheetsClient(config=default_sheets_config(spreadsheet_id=sid))
-        gsm = GoogleSheetsManager(client=sheets)
-        status = ToolStatusWriter(sheets=sheets, spreadsheet_id=sid, manager=gsm)
-
-        # Ensure tabs exist once
-        sheets.ensure_tab("Tool_Status")
-        sheets.ensure_tab(HUNTER_TAB_MAIN)
-        sheets.ensure_tab(HUNTER_TAB_AUDIT)
-
-        # One-shot header writes + layout
-        gsm.setup_tabs(
-            headers=[
-                ("Tool_Status", status.header()),
-                (HUNTER_TAB_MAIN, HUNTER_HEADERS_MAIN),
-                (HUNTER_TAB_AUDIT, HUNTER_HEADERS_AUDIT),
-            ],
-            hide_tabs=[HUNTER_TAB_AUDIT],
-            tab_order=["Tool_Status", HUNTER_TAB_MAIN, HUNTER_TAB_AUDIT],
-            overwrite_headers_for_owned_tabs=True,
-        )
+        sheets.ensure_tab(TAB_STATUS)
+        status = ToolStatusWriter(sheets=sheets, spreadsheet_id=sid)
 
         # Estimate total runs from EFFECTIVE lists
         single_kw_runs = len(keywords)
@@ -300,8 +271,8 @@ def run_hunter_job(
             request_id=rid,
             state="RUNNING",
             phase="discover",
-            current=0,
-            total=total_runs_est,
+            current=len(unique_domains_run),
+            total=target_unique_domains,
             message=last_msg,
             meta={
                 "target_unique_domains": target_unique_domains,
@@ -315,11 +286,14 @@ def run_hunter_job(
                 "user_max_web_queries": max_web_queries,
                 "user_max_keywords": max_keywords,
                 "runs_per_loc_hc": runs_per_loc_hc,
+                "total_runs_est": total_runs_est,
+                "runs_done": runs_done,
             },
         )
 
         # Execute
         with HunterClient() as client:
+            # PHASE 1: KEYWORD PROCESSING (Single keywords, pairs, then all keywords)
             for hc_i, hc in enumerate(HEADCOUNT_BUCKETS, start=1):
                 if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
                     break
@@ -330,108 +304,10 @@ def run_hunter_job(
 
                     headquarters_location = {"include": hq_payload["include"]}
 
-                    # 1) WEB_QUERY passes
-                    for q in web_queries:
-                        if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
-                            break
-
-                        composed_query = f"{q} in {loc_label} with company size {hc}"
-                        companies, total, applied_filters = client.discover(query_text=composed_query)
-                        runs_done += 1
-
-                        qt = HunterQueryType.WEB_QUERY
-                        source_query = f'WEB_AI:"{composed_query}"'
-
-                        applied_loc = _applied_location_label(applied_filters)
-                        applied_hc = _applied_headcount_bucket(applied_filters)
-
-                        tagged: list[HunterCompany] = [
-                            c.model_copy(
-                                update={
-                                    "location": applied_loc,
-                                    "headcount_bucket": applied_hc,
-                                    "intended_location": loc_label,
-                                    "intended_headcount_bucket": hc,
-                                    "source_query": source_query,
-                                    "query_type": qt,
-                                }
-                            )
-                            for c in companies
-                        ]
-
-                        rows_main = [_company_to_row(c) for c in tagged]
-
-                        appended = 0
-                        main_to_append: list[list[str]] = []
-                        for r in rows_main:
-                            key = norm(r[HUNTER_DOMAIN_KEY_COL]).lower()
-                            if not key:
-                                continue
-                            if key in unique_domains_run:
-                                continue
-                            unique_domains_run.add(key)
-                            main_to_append.append(r)
-                            appended += 1
-
-                        if gsm and main_to_append:
-                            gsm.queue_append_rows(tab_name=HUNTER_TAB_MAIN, rows=main_to_append)
-
-                        run = HunterRunResult(
-                            query_type=qt,
-                            location=loc_label,
-                            headcount_bucket=hc,
-                            query_text=composed_query,
-                            keywords=[],
-                            keyword_match=None,
-                            applied_filters=applied_filters or {},
-                            applied_location=applied_loc or None,
-                            applied_headcount_bucket=applied_hc or None,
-                            returned_count=len(tagged),
-                            total_results=total,
-                        )
-                        result.runs.append(run)
-                        result.companies.extend(tagged)
-
-                        if gsm:
-                            gsm.queue_append_rows(
-                                tab_name=HUNTER_TAB_AUDIT,
-                                rows=[_audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)],
-                            )
-
-                        last_msg = (
-                            f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
-                            f"[LOC {loc_i}/{len(locations)}] {loc_label} | "
-                            f"WEB_AI appended={appended} | unique_run={len(unique_domains_run)}"
-                        )
-
-                        update_progress(
-                            job_id,
-                            phase="discover",
-                            current=runs_done,
-                            total=total_runs_est,
-                            message=last_msg,
-                            metrics={"unique_domains_run": len(unique_domains_run)},
-                        )
-
-                        status.write(
-                            job_id=job_id,
-                            tool="hunter",
-                            request_id=rid,
-                            state="RUNNING",
-                            phase="discover",
-                            current=runs_done,
-                            total=total_runs_est,
-                            message=last_msg,
-                            meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
-                        )
-
                     if not keywords:
                         continue
 
-                    if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
-                        break
-
-                    # 2a) Single keyword match=any
+                    # 1) Single keyword match=any (FIRST)
                     for kw in keywords:
                         if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
                             break
@@ -478,8 +354,27 @@ def run_hunter_job(
                             main_to_append.append(r)
                             appended += 1
 
-                        if gsm and main_to_append:
-                            gsm.queue_append_rows(tab_name=HUNTER_TAB_MAIN, rows=main_to_append)
+                        # DB-first approach: write to database immediately
+                        if main_to_append:
+                            db_rows = []
+                            for r in main_to_append:
+                                db_row = HunterIOResultRow.from_runner_data(
+                                    job_id=job_id,
+                                    request_id=rid,
+                                    organisation=r[0],  # Organisation (new format)
+                                    domain=r[1],        # Domain (new format)
+                                    location=applied_loc,
+                                    headcount=applied_hc,
+                                    search_query=f"{kw} | {qt.value}",
+                                    debug_filters=f"{loc_label} | {hc}"
+                                )
+                                db_rows.append(db_row)
+                            
+                            # Add to batch processor
+                            if batch_processor:
+                                batch_processor.add_results(db_rows)
+                            
+                            # Note: No live append - export happens at job completion
 
                         run = HunterRunResult(
                             query_type=qt,
@@ -497,11 +392,13 @@ def run_hunter_job(
                         result.runs.append(run)
                         result.companies.extend(tagged)
 
-                        if gsm:
-                            gsm.queue_append_rows(
-                                tab_name=HUNTER_TAB_AUDIT,
-                                rows=[_audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)],
-                            )
+                        audit_row = _audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)
+                        
+                        # Add audit record to batch processor
+                        if batch_processor:
+                            batch_processor.add_audit_records([audit_row])
+                        
+                        # Note: No live append - export happens at job completion
 
                         last_msg = (
                             f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
@@ -524,8 +421,8 @@ def run_hunter_job(
                             request_id=rid,
                             state="RUNNING",
                             phase="discover",
-                            current=runs_done,
-                            total=total_runs_est,
+                            current=len(unique_domains_run),
+                            total=target_unique_domains,
                             message=last_msg,
                             meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
                         )
@@ -533,105 +430,7 @@ def run_hunter_job(
                     if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
                         break
 
-                    # 2b) All keywords match=all
-                    companies, total, applied_filters = client.discover(
-                        headquarters_location=headquarters_location,
-                        headcount_bucket=hc,
-                        keywords_include=keywords,
-                        keyword_match="all",
-                    )
-                    runs_done += 1
-
-                    qt = HunterQueryType.KW_ALL_FULL
-                    source_query = f"KW_ALL:{list(keywords)} | HQ={loc_label} | headcount=\"{hc}\""
-
-                    applied_loc = _applied_location_label(applied_filters)
-                    applied_hc = _applied_headcount_bucket(applied_filters)
-
-                    tagged = [
-                        c.model_copy(
-                            update={
-                                "location": applied_loc,
-                                "headcount_bucket": applied_hc,
-                                "intended_location": loc_label,
-                                "intended_headcount_bucket": hc,
-                                "source_query": source_query,
-                                "query_type": qt,
-                            }
-                        )
-                        for c in companies
-                    ]
-
-                    rows_main = [_company_to_row(c) for c in tagged]
-
-                    appended = 0
-                    main_to_append: list[list[str]] = []
-                    for r in rows_main:
-                        key = norm(r[HUNTER_DOMAIN_KEY_COL]).lower()
-                        if not key:
-                            continue
-                        if key in unique_domains_run:
-                            continue
-                        unique_domains_run.add(key)
-                        main_to_append.append(r)
-                        appended += 1
-
-                    if gsm and main_to_append:
-                        gsm.queue_append_rows(tab_name=HUNTER_TAB_MAIN, rows=main_to_append)
-
-                    run = HunterRunResult(
-                        query_type=qt,
-                        location=loc_label,
-                        headcount_bucket=hc,
-                        query_text=None,
-                        keywords=list(keywords),
-                        keyword_match="all",
-                        applied_filters=applied_filters or {},
-                        applied_location=applied_loc or None,
-                        applied_headcount_bucket=applied_hc or None,
-                        returned_count=len(tagged),
-                        total_results=total,
-                    )
-                    result.runs.append(run)
-                    result.companies.extend(tagged)
-
-                    if gsm:
-                        gsm.queue_append_rows(
-                            tab_name=HUNTER_TAB_AUDIT,
-                            rows=[_audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)],
-                        )
-
-                    last_msg = (
-                        f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
-                        f"[LOC {loc_i}/{len(locations)}] {loc_label} | "
-                        f"KW_ALL appended={appended} | unique_run={len(unique_domains_run)}"
-                    )
-
-                    update_progress(
-                        job_id,
-                        phase="discover",
-                        current=runs_done,
-                        total=total_runs_est,
-                        message=last_msg,
-                        metrics={"unique_domains_run": len(unique_domains_run)},
-                    )
-
-                    status.write(
-                        job_id=job_id,
-                        tool="hunter",
-                        request_id=rid,
-                        state="RUNNING",
-                        phase="discover",
-                        current=runs_done,
-                        total=total_runs_est,
-                        message=last_msg,
-                        meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
-                    )
-
-                    if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
-                        break
-
-                    # 2c) Keyword pairs match=all
+                    # 2) Keyword pairs match=all (SECOND)
                     if len(keywords) >= 2:
                         for k1, k2 in combinations(keywords, 2):
                             if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
@@ -680,8 +479,27 @@ def run_hunter_job(
                                 main_to_append.append(r)
                                 appended += 1
 
-                            if gsm and main_to_append:
-                                gsm.queue_append_rows(tab_name=HUNTER_TAB_MAIN, rows=main_to_append)
+                            # DB-first approach: write to database immediately
+                            if main_to_append:
+                                db_rows = []
+                                for r in main_to_append:
+                                    db_row = HunterIOResultRow.from_runner_data(
+                                        job_id=job_id,
+                                        request_id=rid,
+                                        organisation=r[0],  # Organisation (new format)
+                                        domain=r[1],        # Domain (new format)
+                                        location=applied_loc,
+                                        headcount=applied_hc,
+                                        search_query=f"{k1},{k2} | {qt.value}",
+                                        debug_filters=f"{loc_label} | {hc}"
+                                    )
+                                    db_rows.append(db_row)
+                                
+                                # Add to batch processor
+                                if batch_processor:
+                                    batch_processor.add_results(db_rows)
+                                
+                                # Note: No live append - export happens at job completion
 
                             run = HunterRunResult(
                                 query_type=qt,
@@ -699,11 +517,13 @@ def run_hunter_job(
                             result.runs.append(run)
                             result.companies.extend(tagged)
 
-                            if gsm:
-                                gsm.queue_append_rows(
-                                    tab_name=HUNTER_TAB_AUDIT,
-                                    rows=[_audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)],
-                                )
+                            audit_row = _audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)
+                            
+                            # Add audit record to batch processor
+                            if batch_processor:
+                                batch_processor.add_audit_records([audit_row])
+                            
+                            # Note: No live append - export happens at job completion
 
                             last_msg = (
                                 f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
@@ -726,15 +546,299 @@ def run_hunter_job(
                                 request_id=rid,
                                 state="RUNNING",
                                 phase="discover",
-                                current=runs_done,
-                                total=total_runs_est,
+                                current=len(unique_domains_run),
+                                total=target_unique_domains,
                                 message=last_msg,
                                 meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
                             )
 
-        # Flush buffered writes
-        if gsm:
-            gsm.flush()
+                    if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
+                        break
+
+                    # 3) All keywords match=all (THIRD)
+                    companies, total, applied_filters = client.discover(
+                        headquarters_location=headquarters_location,
+                        headcount_bucket=hc,
+                        keywords_include=keywords,
+                        keyword_match="all",
+                    )
+                    runs_done += 1
+
+                    qt = HunterQueryType.KW_ALL_FULL
+                    source_query = f"KW_ALL:{list(keywords)} | HQ={loc_label} | headcount=\"{hc}\""
+
+                    applied_loc = _applied_location_label(applied_filters)
+                    applied_hc = _applied_headcount_bucket(applied_filters)
+
+                    tagged = [
+                        c.model_copy(
+                            update={
+                                "location": applied_loc,
+                                "headcount_bucket": applied_hc,
+                                "intended_location": loc_label,
+                                "intended_headcount_bucket": hc,
+                                "source_query": source_query,
+                                "query_type": qt,
+                            }
+                        )
+                        for c in companies
+                    ]
+
+                    rows_main = [_company_to_row(c) for c in tagged]
+
+                    appended = 0
+                    main_to_append: list[list[str]] = []
+                    for r in rows_main:
+                        key = norm(r[HUNTER_DOMAIN_KEY_COL]).lower()
+                        if not key:
+                            continue
+                        if key in unique_domains_run:
+                            continue
+                        unique_domains_run.add(key)
+                        main_to_append.append(r)
+                        appended += 1
+
+                    # DB-first approach: write to database immediately
+                    if main_to_append:
+                        db_rows = []
+                        for r in main_to_append:
+                            db_row = HunterIOResultRow.from_runner_data(
+                                job_id=job_id,
+                                request_id=rid,
+                                organisation=r[0],  # Organisation (new format)
+                                domain=r[1],        # Domain (new format)
+                                location=applied_loc,
+                                headcount=applied_hc,
+                                search_query=f"{','.join(keywords)} | {qt.value}",
+                                debug_filters=f"{loc_label} | {hc}"
+                            )
+                            db_rows.append(db_row)
+                        
+                        # Add to batch processor
+                        if batch_processor:
+                            batch_processor.add_results(db_rows)
+                        
+                        # Note: No live append - export happens at job completion
+
+                    run = HunterRunResult(
+                        query_type=qt,
+                        location=loc_label,
+                        headcount_bucket=hc,
+                        query_text=None,
+                        keywords=list(keywords),
+                        keyword_match="all",
+                        applied_filters=applied_filters or {},
+                        applied_location=applied_loc or None,
+                        applied_headcount_bucket=applied_hc or None,
+                        returned_count=len(tagged),
+                        total_results=total,
+                    )
+                    result.runs.append(run)
+                    result.companies.extend(tagged)
+
+                    audit_row = _audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)
+                    
+                    # Add audit record to batch processor
+                    if batch_processor:
+                        batch_processor.add_audit_records([audit_row])
+                    
+                    # Note: No live append - export happens at job completion
+
+                    last_msg = (
+                        f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
+                        f"[LOC {loc_i}/{len(locations)}] {loc_label} | "
+                        f"KW_ALL appended={appended} | unique_run={len(unique_domains_run)}"
+                    )
+
+                    update_progress(
+                        job_id,
+                        phase="discover",
+                        current=runs_done,
+                        total=total_runs_est,
+                        message=last_msg,
+                        metrics={"unique_domains_run": len(unique_domains_run)},
+                    )
+
+                    status.write(
+                        job_id=job_id,
+                        tool="hunter",
+                        request_id=rid,
+                        state="RUNNING",
+                        phase="discover",
+                        current=len(unique_domains_run),
+                        total=target_unique_domains,
+                        message=last_msg,
+                        meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
+                    )
+
+            # PHASE 2: WEB_QUERY PROCESSING (LAST)
+            for hc_i, hc in enumerate(HEADCOUNT_BUCKETS, start=1):
+                if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
+                    break
+
+                for loc_i, (loc_label, hq_payload) in enumerate(locations, start=1):
+                    if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
+                        break
+
+                    headquarters_location = {"include": hq_payload["include"]}
+
+                    # WEB_QUERY passes
+                    for q in web_queries:
+                        if target_unique_domains > 0 and len(unique_domains_run) >= target_unique_domains:
+                            break
+
+                        composed_query = f"{q} in {loc_label} with company size {hc}"
+                        companies, total, applied_filters = client.discover(query_text=composed_query)
+                        runs_done += 1
+
+                        qt = HunterQueryType.WEB_QUERY
+                        source_query = f'WEB_AI:"{composed_query}"'
+
+                        applied_loc = _applied_location_label(applied_filters)
+                        applied_hc = _applied_headcount_bucket(applied_filters)
+
+                        tagged: list[HunterCompany] = [
+                            c.model_copy(
+                                update={
+                                    "location": applied_loc,
+                                    "headcount_bucket": applied_hc,
+                                    "intended_location": loc_label,
+                                    "intended_headcount_bucket": hc,
+                                    "source_query": source_query,
+                                    "query_type": qt,
+                                }
+                            )
+                            for c in companies
+                        ]
+
+                        rows_main = [_company_to_row(c) for c in tagged]
+
+                        appended = 0
+                        main_to_append: list[list[str]] = []
+                        for r in rows_main:
+                            key = norm(r[HUNTER_DOMAIN_KEY_COL]).lower()
+                            if not key:
+                                continue
+                            if key in unique_domains_run:
+                                continue
+                            unique_domains_run.add(key)
+                            main_to_append.append(r)
+                            appended += 1
+
+                        # DB-first approach: write to database immediately
+                        if main_to_append:
+                            db_rows = []
+                            for r in main_to_append:
+                                db_row = HunterIOResultRow.from_runner_data(
+                                    job_id=job_id,
+                                    request_id=rid,
+                                    organisation=r[0],  # Organisation (new format)
+                                    domain=r[1],        # Domain (new format)
+                                    location=applied_loc,
+                                    headcount=applied_hc,
+                                    search_query=f"{composed_query} | {qt.value}",
+                                    debug_filters=f"{loc_label} | {hc}"
+                                )
+                                db_rows.append(db_row)
+                            
+                            # Add to batch processor
+                            if batch_processor:
+                                batch_processor.add_results(db_rows)
+                            
+                            # Note: No live append - export happens at job completion
+
+                        run = HunterRunResult(
+                            query_type=qt,
+                            location=loc_label,
+                            headcount_bucket=hc,
+                            query_text=composed_query,
+                            keywords=[],
+                            keyword_match=None,
+                            applied_filters=applied_filters or {},
+                            applied_location=applied_loc or None,
+                            applied_headcount_bucket=applied_hc or None,
+                            returned_count=len(tagged),
+                            total_results=total,
+                        )
+                        result.runs.append(run)
+                        result.companies.extend(tagged)
+
+                        audit_row = _audit_to_row(job_id=job_id, request_id=rid, run=run, appended=appended)
+                        
+                        # Add audit record to batch processor
+                        if batch_processor:
+                            batch_processor.add_audit_records([audit_row])
+                        
+                        # Note: No live append - export happens at job completion
+
+                        last_msg = (
+                            f"[HC {hc_i}/{len(HEADCOUNT_BUCKETS)}] {hc} | "
+                            f"[LOC {loc_i}/{len(locations)}] {loc_label} | "
+                            f"WEB_AI appended={appended} | unique_run={len(unique_domains_run)}"
+                        )
+
+                        update_progress(
+                            job_id,
+                            phase="discover",
+                            current=runs_done,
+                            total=total_runs_est,
+                            message=last_msg,
+                            metrics={"unique_domains_run": len(unique_domains_run)},
+                        )
+
+                        status.write(
+                            job_id=job_id,
+                            tool="hunter",
+                            request_id=rid,
+                            state="RUNNING",
+                            phase="discover",
+                            current=len(unique_domains_run),
+                            total=target_unique_domains,
+                            message=last_msg,
+                            meta={"unique_domains_run": len(unique_domains_run), "runs_done": runs_done},
+                        )
+
+        # Flush any remaining batched DB writes
+        if batch_processor:
+            batch_processor.flush_all()
+            log.info("Flushed all remaining batch processor buffers")
+
+        # Export to Google Sheets (DB-first approach)
+        if settings.hunter_sheets_export_enabled:
+            try:
+                log.info("SHEETS_EXPORT | Starting DB→Sheets export")
+                
+                # Query database for results
+                results_repo = HunterIOResultsRepository()
+                success, error, db_results = results_repo.get_companies_by_job(job_id)
+                
+                sheets_rows = []
+                if success and db_results:
+                    sheets_rows = convert_db_results_to_sheets_format(db_results)
+                else:
+                    log.warning(f"SHEETS_EXPORT | Failed to retrieve results: {error}")
+                
+                # Query database for audit records
+                audit_repo = HunterAuditRepository()
+                success_audit, error_audit, db_audit = audit_repo.get_audit_by_job(job_id)
+                
+                audit_sheets_rows = []
+                if success_audit and db_audit:
+                    audit_sheets_rows = convert_db_audit_to_sheets_format(db_audit)
+                
+                # Export using lightweight exporter
+                export_hunter_results(
+                    client=sheets,
+                    job_id=job_id,
+                    request_id=rid,
+                    results_rows=sheets_rows,
+                    audit_rows=audit_sheets_rows if audit_sheets_rows else None,
+                )
+                log.info(f"SHEETS_EXPORT | tool=hunter | results={len(sheets_rows)} | audit={len(audit_sheets_rows)}")
+                    
+            except Exception as e:
+                log.error(f"SHEETS_EXPORT | Failed: {e}")
+                # Don't fail the job if sheets export fails
 
         # Persist JSON artifact
         result.total_unique_domains = len(unique_domains_run)
@@ -752,6 +856,24 @@ def run_hunter_job(
             metrics={"runs_done": runs_done, "unique_domains_run": len(unique_domains_run)},
         )
         log.info("JOB_SUCCEEDED | runs_done=%d | unique_domains_run=%d", runs_done, len(unique_domains_run))
+        
+        # Trigger Master ingestion after successful completion
+        try:
+            from ...master_data.orchestration import trigger_master_job
+            
+            success, error, master_job_id = trigger_master_job(
+                request_id=rid,
+                spreadsheet_id=sid,
+                source_tool="hunter"
+            )
+            
+            if success:
+                log.info("MASTER_TRIGGERED | master_job_id=%s", master_job_id)
+            else:
+                log.warning("MASTER_TRIGGER_FAILED | error=%s", error)
+        except Exception as e:
+            log.error("MASTER_TRIGGER_ERROR | error=%s", e, exc_info=True)
+            # Don't fail the Hunter job if Master trigger fails
 
         if status:
             status.write(
@@ -760,21 +882,22 @@ def run_hunter_job(
                 request_id=rid,
                 state="SUCCEEDED",
                 phase="discover",
-                current=runs_done,
-                total=total_runs_est,
+                current=len(unique_domains_run),
+                total=target_unique_domains,
                 message="Hunter job completed.",
                 meta={"runs_done": runs_done, "unique_domains_run": len(unique_domains_run)},
                 force=True,
             )
-        if gsm:
-            gsm.flush()
 
     except Exception as exc:
         try:
-            if gsm:
-                gsm.flush()
+            # Flush any remaining batched DB writes on failure
+            if batch_processor:
+                batch_processor.flush_all()
+                log.info("Flushed remaining batch processor buffers on failure")
         except Exception:
-            logger.exception("SHEETS_MANAGER_FINAL_FLUSH_FAILED")
+            logger.exception("BATCH_PROCESSOR_FINAL_FLUSH_FAILED")
+        
 
         mark_failed(job_id, error=str(exc), message="Hunter job failed.")
         log.exception("JOB_FAILED | error=%s", exc)
@@ -787,8 +910,8 @@ def run_hunter_job(
                     request_id=rid or "",
                     state="FAILED",
                     phase="discover",
-                    current=runs_done,
-                    total=total_runs_est,
+                    current=len(unique_domains_run),
+                    total=target_unique_domains,
                     message=str(exc),
                     meta={"runs_done": runs_done, "unique_domains_run": len(unique_domains_run)},
                     force=True,
