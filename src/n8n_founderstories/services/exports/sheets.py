@@ -71,11 +71,34 @@ class _RateLimiter:
 
 
 _SHARED_WRITE_LIMITER = _RateLimiter(
-    min_delay_seconds=float(getattr(settings, "google_sheets_min_write_delay_seconds", 1.10))
+    min_delay_seconds=float(getattr(settings, "google_sheets_min_write_delay_seconds", 1.5))
 )
 _SHARED_READ_LIMITER = _RateLimiter(
-    min_delay_seconds=float(getattr(settings, "google_sheets_min_read_delay_seconds", 1.2))
+    min_delay_seconds=float(getattr(settings, "google_sheets_min_read_delay_seconds", 1.5))
 )
+
+
+class _SimpleCache:
+    """Thread-safe cache for sheet maps."""
+    
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._data: dict[str, dict[str, int]] = {}
+    
+    def get(self, key: str) -> dict[str, int] | None:
+        with self._lock:
+            return self._data.get(key)
+    
+    def put(self, key: str, value: dict[str, int]) -> None:
+        with self._lock:
+            self._data[key] = value
+    
+    def invalidate(self, key: str) -> None:
+        with self._lock:
+            self._data.pop(key, None)
+
+
+_SHEET_MAP_CACHE = _SimpleCache()
 
 
 @dataclass(frozen=True)
@@ -119,46 +142,6 @@ def _parse_row_from_updated_range(updated_range: str) -> int | None:
         return int(m.group(1))
     except Exception:
         return None
-
-
-class _SheetMapCache:
-    def __init__(self, *, ttl_seconds: float) -> None:
-        self._ttl = float(ttl_seconds)
-        self._lock = Lock()
-        self._cache: dict[str, tuple[float, dict[str, int]]] = {}
-
-    def get(self, spreadsheet_id: str) -> dict[str, int] | None:
-        sid = norm(spreadsheet_id)
-        if not sid:
-            return None
-        now = time.time()
-        with self._lock:
-            item = self._cache.get(sid)
-            if not item:
-                return None
-            ts, data = item
-            if (now - ts) > self._ttl:
-                return None
-            return dict(data)
-
-    def put(self, spreadsheet_id: str, data: dict[str, int]) -> None:
-        sid = norm(spreadsheet_id)
-        if not sid:
-            return
-        with self._lock:
-            self._cache[sid] = (time.time(), dict(data))
-
-    def invalidate(self, spreadsheet_id: str) -> None:
-        sid = norm(spreadsheet_id)
-        if not sid:
-            return
-        with self._lock:
-            self._cache.pop(sid, None)
-
-
-_SHEET_MAP_CACHE = _SheetMapCache(
-    ttl_seconds=float(getattr(settings, "google_sheets_sheet_map_cache_ttl_seconds", 120.0))
-)
 
 
 class SheetsClient:
@@ -348,11 +331,12 @@ class SheetsClient:
     # -------------------------------------------------------------------------
 
     def ensure_tab(self, tab_name: str) -> None:
+        """Ensure a tab exists. Minimal implementation for export-only workflow."""
         name = norm(tab_name)
         if not name:
             raise ValueError("tab_name must not be empty.")
 
-        # Fast path: cached map.
+        # Fast path: check cache
         if name in self.get_sheet_map():
             return
 
@@ -365,7 +349,6 @@ class SheetsClient:
 
         except HttpError as exc:  # type: ignore
             msg = _exc_message(exc).lower()
-            # If it already exists, do not force a read refresh here. Let TTL refresh later.
             if "already exists" in msg:
                 logger.info(
                     "SHEETS_ADD_TAB_RACE_OK | spreadsheet=%s | tab=%s",
@@ -411,6 +394,21 @@ class SheetsClient:
                 return
             raise
 
+    def ensure_tab_with_header(self, tab_name: str, headers: list[str]) -> None:
+        """
+        Ensure tab exists and has headers in row 1.
+        Minimal implementation for Tool_Status compatibility.
+        """
+        name = norm(tab_name)
+        if not name or not headers:
+            raise ValueError("tab_name and headers must not be empty.")
+        
+        # Ensure tab exists
+        self.ensure_tab(name)
+        
+        # Write headers to row 1
+        self.write_range(tab_name=name, start_cell="A1", values=[headers])
+
     def delete_tab(self, *, tab_name: str) -> bool:
         name = norm(tab_name)
         if not name:
@@ -425,81 +423,16 @@ class SheetsClient:
         logger.info("SHEETS_DELETE_TAB | spreadsheet=%s | tab=%s", self._spreadsheet_id, name)
         return True
 
-    def delete_sheet_if_exists(self, *, tab_name: str) -> None:
-        self.delete_tab(tab_name=tab_name)
-
-    def move_tab(self, *, tab_name: str, index: int) -> None:
-        sid = self.get_sheet_id(tab_name)
-        if sid is None:
-            return
-
-        body = {
-            "requests": [
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(index)}, "fields": "index"}}
-            ]
-        }
-        self._batch_update(body)
-
-    def hide_tab(self, *, tab_name: str) -> None:
-        sid = self.get_sheet_id(tab_name)
-        if sid is None:
-            return
-
-        body = {
-            "requests": [
-                {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
-            ]
-        }
-        self._batch_update(body)
-
     # -------------------------------------------------------------------------
-    # Headers
+    # REMOVED: delete_sheet_if_exists, move_tab, hide_tab
+    # These are not needed for export-only workflow
     # -------------------------------------------------------------------------
 
-    def ensure_header(self, tab_name: str, header: Sequence[str]) -> None:
-        """
-        NOTE: Keep for compatibility, but avoid in hot paths.
-        Prefer manager.setup_tabs(overwrite_headers_for_owned_tabs=True).
-        """
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        hdr = [norm(h) for h in header]
-        if not hdr or any(not h for h in hdr):
-            raise ValueError("header must be a non-empty list of non-empty strings.")
-
-        def _read():
-            return self._service.spreadsheets().values().get(
-                spreadsheetId=self._spreadsheet_id,
-                range=f"{name}!1:1",
-            ).execute()
-
-        resp = self._execute_read(op_name=f"read_header:{name}", fn=_read)
-        values = (resp or {}).get("values") or []
-        if values and any((v or "").strip() for v in values[0] if isinstance(v, str)):
-            return
-
-        logger.info(
-            "SHEETS_WRITE_HEADER | spreadsheet=%s | tab=%s | cols=%d",
-            self._spreadsheet_id,
-            name,
-            len(hdr),
-        )
-
-        def _do():
-            return self._service.spreadsheets().values().update(
-                spreadsheetId=self._spreadsheet_id,
-                range=f"{name}!A1",
-                valueInputOption="RAW",
-                body={"values": [hdr]},
-            ).execute()
-
-        self._execute_write(op_name=f"write_header:{name}", fn=_do)
-
-    def ensure_tab_with_header(self, tab_name: str, header: Sequence[str]) -> None:
-        self.ensure_tab(tab_name)
-        self.ensure_header(tab_name, header)
+    # -------------------------------------------------------------------------
+    # Headers - SIMPLIFIED
+    # -------------------------------------------------------------------------
+    # NOTE: Header management is now handled by bulk write operations
+    # No separate ensure_header needed for export-only workflow
 
     # -------------------------------------------------------------------------
     # Values read/write/append
@@ -586,74 +519,18 @@ class SheetsClient:
         return self._execute_write(op_name=f"append_rows:{name}", fn=_do)
 
     # -------------------------------------------------------------------------
-    # Dedupe helpers
+    # REMOVED: Dedupe helpers (load_existing_keys, append_rows_deduped)
+    # Deduplication is now handled in the database, not in Sheets
     # -------------------------------------------------------------------------
 
-    def load_existing_keys(self, *, tab_name: str, key_col: int) -> set[str]:
-        """
-        WARNING: full-column reads do not scale. Use sparingly.
-        Prefer run-local dedupe or a dedicated Dedupe_Index tab.
-        """
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-        if key_col < 0:
-            raise ValueError("key_col must be >= 0.")
-
-        col_letter = _col_index_to_a1(key_col)
-        values = self.read_range(tab_name=name, a1_range=f"{col_letter}:{col_letter}")
-
-        out: set[str] = set()
-        for row in values:
-            if not row:
-                continue
-            v = norm(row[0]).lower()
-            if v:
-                out.add(v)
-        return out
-
-    def append_rows_deduped(
-        self,
-        *,
-        tab_name: str,
-        rows: Sequence[Sequence[str]],
-        key_col: int,
-        existing_keys: set[str] | None = None,
-    ) -> int:
-        if not rows:
-            return 0
-
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        keys = existing_keys if existing_keys is not None else self.load_existing_keys(tab_name=name, key_col=key_col)
-
-        out: list[list[str]] = []
-        appended = 0
-
-        for r in rows:
-            if key_col >= len(r):
-                continue
-            key = norm(r[key_col]).lower()
-            if not key or key in keys:
-                continue
-            keys.add(key)
-            out.append([norm(str(c)) for c in r])
-            appended += 1
-
-        if out:
-            self.append_rows(tab_name=name, rows=out)
-
-        return appended
-
     # -------------------------------------------------------------------------
-    # Conditional formatting helpers
+    # Conditional formatting helpers - KEPT FOR TOOL_STATUS ONLY
     # -------------------------------------------------------------------------
 
     def replace_conditional_format_rules(self, *, tab_name: str, rules: list[dict]) -> None:
         """
-        Heavy read. Use during setup only, not per job.
+        Replace conditional formatting rules for a tab.
+        Used ONLY for Tool_Status tab coloring. Heavy read - use during setup only.
         """
         sheet_id = self.get_sheet_id(tab_name)
         if sheet_id is None:
@@ -702,6 +579,7 @@ class SheetsClient:
         end_row_index: int | None = None,
         background_rgb: tuple[float, float, float] | None = None,
     ) -> dict:
+        """Build conditional format rule with custom formula. Used for Tool_Status coloring."""
         rng: dict[str, Any] = {
             "sheetId": int(sheet_id),
             "startRowIndex": int(start_row_index),
@@ -736,6 +614,7 @@ class SheetsClient:
         background_rgb: tuple[float, float, float],
         end_row_index: int | None = None,
     ) -> dict:
+        """Build conditional format rule for text equality. Used for Tool_Status coloring."""
         eval_col_abs = start_col_index + int(eval_col_index_in_range)
         eval_col_letter = _col_index_to_a1(eval_col_abs)
         formula = f'=${eval_col_letter}2="{str(equals_text)}"'
@@ -751,44 +630,75 @@ class SheetsClient:
         )
 
     # -------------------------------------------------------------------------
-    # Layout formatting helpers (alignment + autosize)
+    # Minimal formatting helpers - ONLY for Tool_Status
     # -------------------------------------------------------------------------
 
-    def auto_resize_columns(
+    def format_table_layout(
         self,
         *,
         tab_name: str,
-        start_col_index: int = 0,
-        end_col_index: int | None = None,
+        n_cols: int,
+        last_row: int,
+        header_row: bool = True,
+        auto_resize: bool = False,
+        wrap_strategy_body: str | None = None,
+        header_height: int | None = None,
+        body_row_height: int | None = None,
     ) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        sheet_id = self.get_sheet_id(name)
+        """
+        Minimal table formatting for Tool_Status.
+        Only applies basic formatting, no heavy operations.
+        """
+        sheet_id = self.get_sheet_id(tab_name)
         if sheet_id is None:
             return
 
-        if start_col_index < 0:
-            start_col_index = 0
+        requests: list[dict] = []
 
-        if end_col_index is None:
-            end_col_index = 26
-
-        if end_col_index <= start_col_index:
-            return
-
-        req = {
-            "autoResizeDimensions": {
-                "dimensions": {
-                    "sheetId": int(sheet_id),
-                    "dimension": "COLUMNS",
-                    "startIndex": int(start_col_index),
-                    "endIndex": int(end_col_index),
+        # Set row heights if specified
+        if header_row and header_height:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": 0,
+                        "endIndex": 1,
+                    },
+                    "properties": {"pixelSize": header_height},
+                    "fields": "pixelSize",
                 }
-            }
-        }
-        self.batch_update_requests(requests=[req])
+            })
+
+        if body_row_height:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": last_row,
+                    },
+                    "properties": {"pixelSize": body_row_height},
+                    "fields": "pixelSize",
+                }
+            })
+
+        # Auto-resize columns if requested
+        if auto_resize:
+            requests.append({
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": n_cols,
+                    }
+                }
+            })
+
+        if requests:
+            self.batch_update_requests(requests=requests)
 
     def format_cells(
         self,
@@ -803,316 +713,61 @@ class SheetsClient:
         bold: bool | None = None,
         wrap_strategy: str | None = None,
     ) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        sheet_id = self.get_sheet_id(name)
+        """
+        Minimal cell formatting for Tool_Status.
+        Only applies basic text formatting.
+        """
+        sheet_id = self.get_sheet_id(tab_name)
         if sheet_id is None:
             return
 
-        start_row_index = max(0, int(start_row_index))
-        start_col_index = max(0, int(start_col_index))
-        end_row_index = max(start_row_index + 1, int(end_row_index))
-        end_col_index = max(start_col_index + 1, int(end_col_index))
-
-        user_fmt: dict[str, Any] = {}
+        cell_format: dict[str, Any] = {}
         fields: list[str] = []
 
         if horizontal_align:
-            user_fmt["horizontalAlignment"] = str(horizontal_align).upper()
-            fields.append("userEnteredFormat.horizontalAlignment")
+            cell_format["horizontalAlignment"] = horizontal_align.upper()
+            fields.append("horizontalAlignment")
 
         if vertical_align:
-            user_fmt["verticalAlignment"] = str(vertical_align).upper()
-            fields.append("userEnteredFormat.verticalAlignment")
-
-        if wrap_strategy:
-            user_fmt["wrapStrategy"] = str(wrap_strategy).upper()
-            fields.append("userEnteredFormat.wrapStrategy")
+            cell_format["verticalAlignment"] = vertical_align.upper()
+            fields.append("verticalAlignment")
 
         if bold is not None:
-            user_fmt.setdefault("textFormat", {})
-            user_fmt["textFormat"]["bold"] = bool(bold)
-            fields.append("userEnteredFormat.textFormat.bold")
+            cell_format["textFormat"] = {"bold": bool(bold)}
+            fields.append("textFormat.bold")
 
-        if not fields:
+        if wrap_strategy:
+            cell_format["wrapStrategy"] = wrap_strategy.upper()
+            fields.append("wrapStrategy")
+
+        if not cell_format:
             return
 
-        req = {
+        request = {
             "repeatCell": {
                 "range": {
-                    "sheetId": int(sheet_id),
-                    "startRowIndex": int(start_row_index),
-                    "endRowIndex": int(end_row_index),
-                    "startColumnIndex": int(start_col_index),
-                    "endColumnIndex": int(end_col_index),
+                    "sheetId": sheet_id,
+                    "startRowIndex": start_row_index,
+                    "endRowIndex": end_row_index,
+                    "startColumnIndex": start_col_index,
+                    "endColumnIndex": end_col_index,
                 },
-                "cell": {"userEnteredFormat": user_fmt},
-                "fields": ",".join(fields),
+                "cell": {"userEnteredFormat": cell_format},
+                "fields": ",".join(f"userEnteredFormat.{f}" for f in fields),
             }
         }
-        self.batch_update_requests(requests=[req])
 
-    def format_table_layout(
-        self,
-        *,
-        tab_name: str,
-        n_cols: int,
-        last_row: int,
-        header_row: bool = True,
-        auto_resize: bool = True,
-        wrap_strategy_body: str = "OVERFLOW_CELL",
-    ) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        n_cols = max(1, int(n_cols))
-        last_row = max(1, int(last_row))
-
-        if header_row:
-            self.format_cells(
-                tab_name=name,
-                start_row_index=0,
-                end_row_index=1,
-                start_col_index=0,
-                end_col_index=n_cols,
-                horizontal_align="CENTER",
-                vertical_align="MIDDLE",
-                bold=True,
-                wrap_strategy="WRAP",
-            )
-
-        if last_row >= 2:
-            self.format_cells(
-                tab_name=name,
-                start_row_index=1,
-                end_row_index=last_row,
-                start_col_index=0,
-                end_col_index=n_cols,
-                horizontal_align="LEFT",
-                vertical_align="MIDDLE",
-                bold=False,
-                wrap_strategy=wrap_strategy_body,
-            )
-
-        if auto_resize:
-            self.auto_resize_columns(tab_name=name, start_col_index=0, end_col_index=n_cols)
+        self.batch_update_requests(requests=[request])
 
     # -------------------------------------------------------------------------
-    # Batch cell updates + bounded upsert
+    # REMOVED: Batch cell updates, get_last_row, upsert_row_by_key
+    # Not needed for bulk export workflow
     # -------------------------------------------------------------------------
 
-    def batch_update_cells(self, *, tab_name: str, updates: Sequence[Tuple[str, str]]) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-        if not updates:
-            return
-
-        data = []
-        for cell, value in updates:
-            c = norm(cell).upper()
-            if not c:
-                continue
-            data.append({"range": f"{name}!{c}", "values": [[norm(value)]]})
-
-        if not data:
-            return
-
-        self.values_batch_update(data=data, value_input_option="RAW")
-
-    def get_last_row(self, *, tab_name: str, signal_col: int = 0) -> int:
-        """
-        WARNING: Reads entire signal column. Use sparingly.
-        """
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        if signal_col < 0:
-            signal_col = 0
-
-        col = _col_index_to_a1(signal_col)
-        values = self.read_range(tab_name=name, a1_range=f"{col}:{col}")
-        return len(values or [])
-
-    def upsert_row_by_key(
-        self,
-        *,
-        tab_name: str,
-        key: str,
-        row_values: list[str],
-        key_col_letter: str = "A",
-        start_row: int = 2,
-        max_scan_rows: int = 2000,
-    ) -> int:
-        name = norm(tab_name)
-        k = norm(key)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-        if not k:
-            raise ValueError("key must not be empty.")
-        if not row_values:
-            raise ValueError("row_values must not be empty.")
-
-        key_col = norm(key_col_letter).upper()
-        if not key_col:
-            raise ValueError("key_col_letter must not be empty.")
-
-        end_row = start_row + max_scan_rows - 1
-        keys = self.read_range(tab_name=name, a1_range=f"{key_col}{start_row}:{key_col}{end_row}")
-
-        found_row: int | None = None
-        row_num = start_row
-        target = k.lower()
-
-        for r in keys:
-            v = norm(r[0]).lower() if r else ""
-            if v == target:
-                found_row = row_num
-                break
-            row_num += 1
-
-        if found_row is not None:
-            self.write_range(tab_name=name, start_cell=f"A{found_row}", values=[row_values])
-            return found_row
-
-        self.append_rows(tab_name=name, rows=[row_values])
-        return -1
-
     # -------------------------------------------------------------------------
-    # Data validation helpers (dropdowns / checkboxes)
+    # REMOVED: Data validation helpers (dropdowns/checkboxes)
+    # Not needed for export-only workflow
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _a1_col_to_index(col: str) -> int:
-        c = (col or "").strip().upper()
-        if not c or not c.isalpha():
-            raise ValueError(f"Invalid column: {col!r}")
-        n = 0
-        for ch in c:
-            n = n * 26 + (ord(ch) - ord("A") + 1)
-        return n - 1
-
-    @staticmethod
-    def _parse_a1_cell(a1: str) -> tuple[int, int | None]:
-        s = (a1 or "").strip()
-        m = SheetsClient._A1_RE.match(s)
-        if not m:
-            raise ValueError(f"Invalid A1 token: {a1!r}")
-        col_letters, row_digits = m.group(1), m.group(2)
-        col_idx = SheetsClient._a1_col_to_index(col_letters)
-        if row_digits is None:
-            return (col_idx, None)
-        return (col_idx, int(row_digits) - 1)
-
-    @staticmethod
-    def _a1_to_grid_range(
-        *,
-        sheet_id: int,
-        a1_range: str,
-        default_max_rows: int = 20000,
-    ) -> dict[str, Any]:
-        rng = (a1_range or "").strip().upper()
-        if not rng:
-            raise ValueError("a1_range must not be empty.")
-
-        if ":" in rng:
-            left, right = rng.split(":", 1)
-            c0, r0 = SheetsClient._parse_a1_cell(left)
-            c1, r1 = SheetsClient._parse_a1_cell(right)
-
-            start_col = int(c0)
-            end_col_excl = int(c1 + 1)
-
-            start_row = int(r0) if r0 is not None else 0
-            end_row_excl = int(r1 + 1) if r1 is not None else int(default_max_rows)
-
-        else:
-            c0, r0 = SheetsClient._parse_a1_cell(rng)
-            start_col = int(c0)
-            end_col_excl = int(c0 + 1)
-
-            start_row = int(r0) if r0 is not None else 0
-            end_row_excl = int(r0 + 1) if r0 is not None else int(default_max_rows)
-
-        return {
-            "sheetId": int(sheet_id),
-            "startRowIndex": int(start_row),
-            "endRowIndex": int(end_row_excl),
-            "startColumnIndex": int(start_col),
-            "endColumnIndex": int(end_col_excl),
-        }
-
-    def set_data_validation_list(
-        self,
-        *,
-        tab_name: str,
-        a1_range: str,
-        options: Sequence[str],
-        strict: bool = True,
-        show_dropdown: bool = True,
-        default_max_rows: int = 20000,
-    ) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        sheet_id = self.get_sheet_id(name)
-        if sheet_id is None:
-            return
-
-        opts = [norm(str(o)) for o in (options or []) if norm(str(o))]
-        if not opts:
-            raise ValueError("options must not be empty.")
-
-        grid = SheetsClient._a1_to_grid_range(
-            sheet_id=sheet_id,
-            a1_range=a1_range,
-            default_max_rows=default_max_rows,
-        )
-
-        rule = {
-            "condition": {
-                "type": "ONE_OF_LIST",
-                "values": [{"userEnteredValue": o} for o in opts],
-            },
-            "strict": bool(strict),
-            "showCustomUi": bool(show_dropdown),
-        }
-
-        self.batch_update_requests(requests=[{"setDataValidation": {"range": grid, "rule": rule}}])
-
-    def set_checkbox_validation(
-        self,
-        *,
-        tab_name: str,
-        a1_range: str,
-        default_max_rows: int = 20000,
-    ) -> None:
-        name = norm(tab_name)
-        if not name:
-            raise ValueError("tab_name must not be empty.")
-
-        sheet_id = self.get_sheet_id(name)
-        if sheet_id is None:
-            return
-
-        grid = SheetsClient._a1_to_grid_range(
-            sheet_id=sheet_id,
-            a1_range=a1_range,
-            default_max_rows=default_max_rows,
-        )
-
-        rule = {
-            "condition": {"type": "BOOLEAN"},
-            "strict": True,
-            "showCustomUi": True,
-        }
-
-        self.batch_update_requests(requests=[{"setDataValidation": {"range": grid, "rule": rule}}])
 
     # -------------------------------------------------------------------------
     # Append response parser

@@ -197,12 +197,6 @@ class GoogleSheetsManager:
             except Exception:
                 logger.exception("SHEETS_MANAGER_FLUSH_FAILED (values)")
 
-    def delete_default_sheet_best_effort(self) -> None:
-        try:
-            if self.client.delete_tab(tab_name="Sheet1"):
-                logger.info("SHEETS_DELETE_DEFAULT | Sheet1")
-        except Exception:
-            logger.exception("SHEETS_DELETE_DEFAULT_FAILED")
 
     def queue_batch_update_request(self, request: dict) -> None:
         if not isinstance(request, dict):
@@ -316,111 +310,8 @@ class GoogleSheetsManager:
                     self._append_rows_by_tab.setdefault(tab, []).extend(rows)
             raise
 
-    # -------------------------------------------------------------------------
-    # Initialization marker (prevents repeated setup in same process)
-    # -------------------------------------------------------------------------
-
-    def is_initialized(self, *, tab_name: str = "Dashboard", cell: str = "A1", marker_prefix: str = "__INIT_DONE__") -> bool:
-        try:
-            v = self.read_cell(tab_name=tab_name, cell=cell)
-            return v.startswith(marker_prefix)
-        except Exception:
-            return False
-
-    def write_init_marker(self, *, tab_name: str = "Dashboard", cell: str = "A1", marker: str | None = None) -> None:
-        if marker is None:
-            marker = f"__INIT_DONE__:{int(time.time())}"
-        self.queue_values_update(tab_name=tab_name, a1_range=cell, values=[[marker]])
 
     # -------------------------------------------------------------------------
-    # High-level convenience ops
+    # Overwrite mode operations (for DB-first exports)
     # -------------------------------------------------------------------------
 
-    def setup_tabs(
-        self,
-        *,
-        headers: Sequence[Tuple[str, Sequence[str]]],
-        hide_tabs: Sequence[str] = (),
-        tab_order: Sequence[str] = (),
-        tab_colors: Optional[Dict[str, Tuple[float, float, float]]] = None,
-        overwrite_headers_for_owned_tabs: bool = True,
-        init_marker_tab: str = "Dashboard",
-        init_marker_cell: str = "A1",
-        init_marker_prefix: str = "__INIT_DONE__",
-    ) -> None:
-        """
-        Standard workbook setup.
-
-        Key production behaviors:
-        - Bulk tab creation (one sheet-map read, one batchUpdate write).
-        - Optional init marker to avoid repeated setup.
-        - Avoid ensure_header (reads) by overwriting headers in one batch update.
-
-        Note:
-        - This lock is process-local. If you run multiple processes, add a distributed lock (Redis).
-        """
-        spreadsheet_lock = _get_spreadsheet_lock(self.client.spreadsheet_id)
-
-        with spreadsheet_lock:
-            # Skip if already initialized (one read)
-            if self.is_initialized(tab_name=init_marker_tab, cell=init_marker_cell, marker_prefix=init_marker_prefix):
-                return
-
-            tabs = [t for t, _ in headers]
-            # Ensure marker tab exists too
-            if norm(init_marker_tab) and init_marker_tab not in tabs:
-                tabs = [init_marker_tab] + tabs
-
-            # 1) Ensure tabs exist in bulk
-            self.client.ensure_tabs(tabs)
-
-            # 2) Headers
-            if overwrite_headers_for_owned_tabs:
-                for tab, hdr in headers:
-                    self.queue_values_update(tab_name=tab, a1_range="A1", values=[list(hdr)])
-            else:
-                # Avoid this in hot paths; it reads row 1
-                for tab, hdr in headers:
-                    self.client.ensure_header(tab, hdr)
-
-            # 3) Hide tabs
-            for t in hide_tabs:
-                sid = self.client.get_sheet_id(t)
-                if sid is None:
-                    continue
-                self.queue_batch_update_request(
-                    {"updateSheetProperties": {"properties": {"sheetId": sid, "hidden": True}, "fields": "hidden"}}
-                )
-
-            # 4) Reorder tabs
-            for idx, t in enumerate(tab_order):
-                sid = self.client.get_sheet_id(t)
-                if sid is None:
-                    continue
-                self.queue_batch_update_request(
-                    {"updateSheetProperties": {"properties": {"sheetId": sid, "index": int(idx)}, "fields": "index"}}
-                )
-
-            # 5) Tab colors
-            if tab_colors:
-                for t, (r, g, b) in tab_colors.items():
-                    sid = self.client.get_sheet_id(t)
-                    if sid is None:
-                        continue
-                    self.queue_batch_update_request(
-                        {
-                            "updateSheetProperties": {
-                                "properties": {
-                                    "sheetId": sid,
-                                    "tabColor": {"red": float(r), "green": float(g), "blue": float(b)},
-                                },
-                                "fields": "tabColor",
-                            }
-                        }
-                    )
-
-            self.delete_default_sheet_best_effort()
-
-            # 6) Write init marker last, then flush once
-            self.write_init_marker(tab_name=init_marker_tab, cell=init_marker_cell)
-            self.flush()
