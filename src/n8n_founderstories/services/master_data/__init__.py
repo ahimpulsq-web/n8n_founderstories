@@ -8,7 +8,6 @@ This module provides DB-first Master ingestion that:
 - Exports to Sheets at job end (optional)
 """
 
-from .runner import run_master_job_db_first
 from .models import MasterRow, MasterWatermark, MasterSource
 from .repos import MasterResultsRepository, MasterWatermarkRepository, MasterSourceRepository
 from .adapters import (

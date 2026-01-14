@@ -46,7 +46,7 @@ def ensure_migrations_table(dsn: str) -> None:
             with conn.cursor() as cur:
                 cur.execute(create_table_sql)
                 conn.commit()
-        logger.info("Schema migrations table ready")
+        logger.debug("Schema migrations table ready")
     except Exception as e:
         raise MigrationError(f"Failed to create migrations table: {e}") from e
 
@@ -120,7 +120,7 @@ def apply_migration(dsn: str, filename: str, filepath: Path) -> None:
                 
                 conn.commit()
         
-        logger.info("Applied migration: %s", filename)
+        logger.debug("Applied migration: %s", filename)
         
     except Exception as e:
         raise MigrationError(f"Failed to apply migration {filename}: {e}") from e
@@ -146,7 +146,7 @@ def run_migrations(dsn: str, migrations_dir: Path | str | None = None) -> int:
     else:
         migrations_dir = migrations_dir.resolve()
     
-    logger.info("Running migrations from: %s", migrations_dir)
+    logger.debug("Running migrations from: %s", migrations_dir)
     
     try:
         # Ensure migrations table exists
@@ -154,26 +154,26 @@ def run_migrations(dsn: str, migrations_dir: Path | str | None = None) -> int:
         
         # Get applied migrations
         applied = get_applied_migrations(dsn)
-        logger.info("Found %d already applied migrations", len(applied))
+        logger.debug("Found %d already applied migrations", len(applied))
         
         # Get available migration files
         migration_files = get_migration_files(migrations_dir)
-        logger.info("Found %d migration files", len(migration_files))
+        logger.debug("Found %d migration files", len(migration_files))
         
         # Apply pending migrations
         applied_count = 0
         for filename, filepath in migration_files:
             if filename not in applied:
-                logger.info("Applying migration: %s", filename)
+                logger.debug("Applying migration: %s", filename)
                 apply_migration(dsn, filename, filepath)
                 applied_count += 1
             else:
                 logger.debug("Skipping already applied migration: %s", filename)
         
         if applied_count == 0:
-            logger.info("No pending migrations to apply")
+            logger.debug("No pending migrations to apply")
         else:
-            logger.info("Successfully applied %d migrations", applied_count)
+            logger.debug("Successfully applied %d migrations", applied_count)
         
         return applied_count
         
@@ -200,7 +200,7 @@ def main():
     
     try:
         applied_count = run_migrations(dsn)
-        logger.info("Migration completed successfully. Applied %d migrations.", applied_count)
+        logger.debug("Migration completed successfully. Applied %d migrations.", applied_count)
     except Exception as e:
         logger.error("Migration failed: %s", e)
         sys.exit(1)

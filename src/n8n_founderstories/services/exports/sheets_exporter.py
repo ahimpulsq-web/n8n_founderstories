@@ -33,6 +33,15 @@ from ...core.utils.text import norm
 
 logger = logging.getLogger(__name__)
 
+# Track which tabs have been formatted to avoid redundant formatting
+_FORMATTED_TABS: set[str] = set()
+
+
+def _format_guard_key(spreadsheet_id: str, tab_name: str) -> str:
+    """Generate unique key for tracking formatted tabs."""
+    from ...core.utils.text import norm
+    return f"{norm(spreadsheet_id)}::{norm(tab_name)}"
+
 
 def _col_index_to_letter(col_index: int) -> str:
     """Convert 0-based column index to Excel-style letter (A, B, ..., Z, AA, AB, ...)."""
@@ -45,6 +54,136 @@ def _col_index_to_letter(col_index: int) -> str:
         n, rem = divmod(n - 1, 26)
         letters.append(chr(ord("A") + rem))
     return "".join(reversed(letters))
+
+
+def format_hunter_tabs_once(client: SheetsClient) -> None:
+    """
+    One-time formatting for HunterIO tabs using a single batchUpdate.
+    
+    Formatting specs:
+    - Column widths: 320, 320, 140, 140, 320, 200 (Organisation, Domain, Location, Headcount, Search Query, Debug Filters)
+    - Row heights: Header 35px, Data rows 30px
+    - Header: Bold, Grey (#F1F3F4)
+    - Data rows: No coloring (white/default)
+    - Hide columns G onwards
+    """
+    spreadsheet_id = client._spreadsheet_id
+    
+    # Check if already formatted
+    main_key = _format_guard_key(spreadsheet_id, TAB_HUNTER_MAIN)
+    if main_key in _FORMATTED_TABS:
+        return
+    
+    try:
+        # Get sheet IDs for both tabs
+        main_sheet_id = client.get_sheet_id(TAB_HUNTER_MAIN)
+        
+        if main_sheet_id is None:
+            logger.warning("HUNTER_FORMAT_SKIP | main_sheet_not_found")
+            return
+        
+        # Build all requests for a single batchUpdate
+        requests = []
+        
+        # === Format HunterIO_v2 (Main) ===
+        # Column widths: 320, 320, 140, 140, 320, 200
+        column_widths = [320, 320, 140, 140, 320, 200]
+        for col_idx, width in enumerate(column_widths):
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": main_sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_idx,
+                        "endIndex": col_idx + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            })
+        
+        # Header row height: 35px
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 35},
+                "fields": "pixelSize",
+            }
+        })
+        
+        # Data rows height: 30px (rows 2-1000)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 1,
+                    "endIndex": 1000,
+                },
+                "properties": {"pixelSize": 30},
+                "fields": "pixelSize",
+            }
+        })
+        
+        # Format header row: Bold, Grey (#F1F3F4), Centered
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(HEADERS_HUNTER_MAIN),
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.945,
+                            "green": 0.953,
+                            "blue": 0.957
+                        },
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "textFormat": {
+                            "fontSize": 10,
+                            "bold": True
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)",
+            }
+        })
+        
+        # Hide columns G onwards (column index 6+)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 6,  # Column G (0-indexed)
+                    "endIndex": 26,   # Hide through column Z
+                },
+                "properties": {"hiddenByUser": True},
+                "fields": "hiddenByUser",
+            }
+        })
+        
+        # Execute single batchUpdate
+        client._service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
+        
+        _FORMATTED_TABS.add(main_key)
+        logger.debug("HUNTER_FORMAT_SUCCESS | tab=%s | requests=%d", TAB_HUNTER_MAIN, len(requests))
+        
+    except Exception as e:
+        logger.warning("HUNTER_FORMAT_FAILED | error=%s", e)
 
 
 def export_table_to_sheet(
@@ -253,6 +392,7 @@ def export_hunter_results(
     - HunterIO_Audit_v2 (optional audit)
     
     Headers are always written explicitly from sheets_schema.py to prevent drift.
+    Applies one-time formatting for professional appearance.
     
     Args:
         client: SheetsClient instance
@@ -279,6 +419,10 @@ def export_hunter_results(
     
     # Export all tabs (tabs created only at export time)
     export_multiple_tables(client, exports)
+    
+    # Apply one-time formatting (only runs once per spreadsheet)
+    format_hunter_tabs_once(client)
+    
     logger.info(f"HUNTER_EXPORT_COMPLETE | job_id={job_id} | tabs={len(exports)}")
 
 

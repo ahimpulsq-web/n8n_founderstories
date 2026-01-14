@@ -274,6 +274,56 @@ def _choose_best_from_pairs(domain: str, pairs: list[tuple[str, str]]) -> Option
     ranked = sorted(emails, key=key, reverse=True)
     return ranked[0] if ranked else base_pick
 
+def format_emails_best_first(*, domain: str, pairs: list[tuple[str, str]]) -> str:
+    """
+    Format emails with their source URLs for storage and display.
+    
+    Output format: (email: url),(email2: url2)
+    - Each email:url pair is wrapped in parentheses
+    - Space after colon
+    - Comma separator without space
+    
+    Args:
+        domain: Domain to prefer when ranking emails
+        pairs: List of (email, source_url) tuples
+        
+    Returns:
+        Formatted string like "(email1: url1),(email2: url2)"
+    """
+    if not pairs:
+        return ""
+
+    # dedupe email list deterministically
+    emails = _dedupe_preserve([ (e or "").strip() for e, _ in pairs if (e or "").strip() ])
+    base_pick = pick_best_email(emails, prefer_domain=domain).best if emails else None
+
+    # best page score per email + choose best url per email
+    best_score: dict[str, int] = {}
+    best_url: dict[str, str] = {}
+    for e, u in pairs:
+        e = (e or "").strip()
+        u = (u or "").strip()
+        if not e:
+            continue
+        s = _page_priority_score(u)
+        prev = best_score.get(e, -1)
+        # higher score wins; tie-breaker url asc for determinism
+        if s > prev or (s == prev and u and u < (best_url.get(e) or "\uffff")):
+            best_score[e] = s
+            best_url[e] = u
+
+    def sort_key(e: str) -> tuple[int, int, str]:
+        return (
+            best_score.get(e, 0),              # page score desc
+            1 if (base_pick and e == base_pick) else 0,  # base pick desc
+            e.lower(),                         # tie-breaker
+        )
+
+    ranked = sorted(emails, key=sort_key, reverse=True)
+    # Format as (email: url),(email2: url2) - parentheses, space after colon, no space after comma
+    return ",".join([f"({e}: {best_url.get(e, '')})" for e in ranked])
+
+
 
 def _norm_visit_key(u: str) -> str:
     """Deduplicate by host+path (ignore query/fragment)."""

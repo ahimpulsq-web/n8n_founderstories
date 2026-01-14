@@ -41,3 +41,7 @@ google-api-python-client
 google-auth 
 google-auth-httplib2
 google-auth-oauthlib
+
+crawl4ai
+playwright
+playwright install

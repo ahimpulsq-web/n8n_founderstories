@@ -82,7 +82,7 @@ def acquire_master_lock(request_id: str, dsn: Optional[str] = None) -> tuple[boo
             acquired = cur.fetchone()[0]
         
         if acquired:
-            logger.info(
+            logger.debug(
                 "MASTER_LOCK_ACQUIRED | request_id=%s | lock_id=%d",
                 request_id,
                 lock_id
@@ -91,7 +91,7 @@ def acquire_master_lock(request_id: str, dsn: Optional[str] = None) -> tuple[boo
         else:
             # Lock is held by another process
             conn.close()
-            logger.info(
+            logger.debug(
                 "MASTER_LOCK_BUSY | request_id=%s | lock_id=%d | skipping",
                 request_id,
                 lock_id
@@ -133,7 +133,7 @@ def release_master_lock(conn: any, request_id: str) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
         
-        logger.info(
+        logger.debug(
             "MASTER_LOCK_RELEASED | request_id=%s | lock_id=%d",
             request_id,
             lock_id
@@ -189,7 +189,7 @@ def mark_pending(request_id: str, triggered_by: Optional[str] = None, dsn: Optio
                 """, (request_id, triggered_by))
                 conn.commit()
         
-        logger.info(
+        logger.debug(
             "MASTER_MARKED_PENDING | request_id=%s | triggered_by=%s",
             request_id,
             triggered_by or "unknown"
@@ -243,7 +243,7 @@ def pop_pending(request_id: str, dsn: Optional[str] = None) -> bool:
                 was_pending = result is not None
                 
                 if was_pending:
-                    logger.info(
+                    logger.debug(
                         "MASTER_POP_PENDING | request_id=%s | was_pending=true | will_rerun=true",
                         request_id
                     )
@@ -318,7 +318,7 @@ def trigger_master_job(
     
     if master_job and master_job.state in {JobState.QUEUED, JobState.RUNNING}:
         # Master is already running - just mark pending and return
-        logger.info(
+        logger.debug(
             "MASTER_ALREADY_RUNNING | request_id=%s | triggered_by=%s | master_job_id=%s | state=%s | marking_pending=true",
             rid,
             source_tool or "unknown",
@@ -335,7 +335,7 @@ def trigger_master_job(
         # Lock is busy or error occurred
         if lock_conn_or_error is None:
             # Lock is held by another Master - mark pending and return
-            logger.info(
+            logger.debug(
                 "MASTER_LOCK_BUSY | request_id=%s | triggered_by=%s | marking_pending=true",
                 rid,
                 source_tool or "unknown"
@@ -386,7 +386,7 @@ def trigger_master_job(
             lock_conn=lock_conn,
         )
         
-        logger.info(
+        logger.debug(
             "MASTER_JOB_TRIGGERED | request_id=%s | job_id=%s | triggered_by=%s | lock_acquired=true",
             rid,
             job_id,

@@ -18,18 +18,11 @@ from __future__ import annotations
 TAB_STATUS = "Tool_Status"
 
 HEADERS_STATUS = [
-    "Job ID",
     "Tool",
-    "Request ID",
     "State",
-    "Phase",
-    "Current",
-    "Total",
-    "Percent",
-    "Message",
-    "Updated At",
-    "Spreadsheet ID",
-    "Meta (JSON)",
+    "Progress",
+    "Request ID",
+    "Job ID",
 ]
 
 # =============================================================================
@@ -113,9 +106,14 @@ TAB_MASTER_MAIN = "Master_v2"
 TAB_MASTER_AUDIT = "Master_Audit_v2"
 
 HEADERS_MASTER_MAIN = [
+    "master_result_id",
     "Organisation",
     "Domain",
     "Source",
+    "Emails",
+    "Contacts",
+    "Extraction Status",
+    "Debug Message",
 ]
 
 HEADERS_MASTER_AUDIT = [

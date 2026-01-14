@@ -108,7 +108,7 @@ def test_connection(dsn: Optional[str] = None) -> tuple[bool, Optional[str]]:
             with conn.cursor() as cur:
                 cur.execute("SELECT version()")
                 version = cur.fetchone()
-                logger.info("PostgreSQL connection successful: %s", version[0] if version else "Unknown version")
+                logger.debug("PostgreSQL connection successful: %s", version[0] if version else "Unknown version")
         return True, None
     except Exception as e:
         error_msg = f"PostgreSQL connection failed: {e}"

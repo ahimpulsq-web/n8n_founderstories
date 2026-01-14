@@ -106,7 +106,7 @@ def safe_bulk_insert(
         log_context["success"] = success
         
         if success:
-            logger.info(
+            logger.debug(
                 "%s PostgreSQL write successful: %d rows inserted "
                 "(job_id=%s, request_id=%s)",
                 log_prefix,

@@ -120,7 +120,7 @@ class MasterResultsRepository:
                             )
             
             self._schema_validated = True
-            logger.info("MASTER_SCHEMA_VALIDATED | domain_norm_exists=true | constraint_exists=true")
+            logger.debug("MASTER_SCHEMA_VALIDATED | domain_norm_exists=true | constraint_exists=true")
             
         except PermanentError:
             raise
@@ -232,7 +232,7 @@ class MasterResultsRepository:
                     inserted_count = affected_count  # Approximate
                     updated_count = 0  # Would need separate query to determine exactly
                     
-                    logger.info(
+                    logger.debug(
                         "MASTER_UPSERT_SUCCESS | rows=%d | affected=%d | tool_breakdown=%s",
                         len(valid_rows),
                         affected_count,

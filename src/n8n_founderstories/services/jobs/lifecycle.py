@@ -62,7 +62,7 @@ def job_lifecycle(
         "phase": phase,
     }
     
-    logger.info(
+    logger.debug(
         "Starting job lifecycle: tool=%s, phase=%s (job_id=%s, request_id=%s)",
         tool,
         phase,
@@ -103,7 +103,7 @@ def job_lifecycle(
         yield
         
         # If we reach here, the job completed successfully
-        logger.info(
+        logger.debug(
             "Job lifecycle completed successfully: tool=%s, phase=%s (job_id=%s, request_id=%s)",
             tool,
             phase,
@@ -284,7 +284,7 @@ class JobProgressTracker:
                     force=True,
                 )
                 
-            logger.info(
+            logger.debug(
                 "Job completed successfully: %s (job_id=%s, request_id=%s)",
                 completion_message,
                 self.job_id,

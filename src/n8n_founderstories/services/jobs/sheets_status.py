@@ -18,11 +18,12 @@ logger = logging.getLogger(__name__)
 # Note: TAB_STATUS and HEADERS_STATUS imported from sheets_schema.py
 
 
-def _percent(current: int | None, total: int | None) -> str:
-    if current is None or not total or total <= 0:
+def _progress_format(current: int | None, total: int | None) -> str:
+    """Format progress as '50/100' or empty string if not available."""
+    if current is None or total is None or total <= 0:
         return ""
     try:
-        return f"{round((current / total) * 100.0, 2)}"
+        return f"{current}/{total}"
     except Exception:
         return ""
 
@@ -32,6 +33,24 @@ _FORMAT_APPLIED: set[str] = set()
 
 def _format_guard_key(spreadsheet_id: str) -> str:
     return f"{norm(spreadsheet_id)}::{TAB_STATUS}"
+
+
+# Tool name display mapping
+TOOL_DISPLAY_NAMES = {
+    "hunter": "HunterIO",
+    "master": "Master",
+    "company_enrichment": "Enrichment",
+    "gmaps": "GMaps",
+    "google_maps": "GMaps",
+    "web_scraper": "WebScraper",
+    "serp": "SERP",
+}
+
+
+def _normalize_tool_name(tool: str) -> str:
+    """Normalize internal tool names to display names."""
+    normalized = norm(tool).lower()
+    return TOOL_DISPLAY_NAMES.get(normalized, tool.title() if tool else "")
 
 
 @dataclass
@@ -69,188 +88,232 @@ class ToolStatusWriter:
     # ---------------------------------------------------------------------
 
     def ensure_ready(self, *, force_format: bool = False) -> None:
+        """Ensure tab is ready with one-time setup."""
         if self._is_ready:
-            if force_format:
-                self._apply_formatting_best_effort(force=True)
             return
 
-        self.sheets.ensure_tab_with_header(TAB_STATUS, HEADERS_STATUS)
-        
-        # Clean up any existing duplicates on first initialization
-        self.cleanup_duplicates()
-        
-        self._apply_formatting_best_effort(force=True)  # Always force on first setup
-        self._is_ready = True
-
-    def _apply_formatting_best_effort(self, *, force: bool) -> None:
         sid = norm(self.spreadsheet_id)
         if not sid:
             return
 
         key = _format_guard_key(sid)
-        if (not force) and (key in _FORMAT_APPLIED):
+        if key in _FORMAT_APPLIED:
+            self._is_ready = True
             return
 
         try:
-            time.sleep(0.15)  # reduce race immediately after tab creation
-
-            sheet_id = self.sheets.get_sheet_id(TAB_STATUS)
-            if sheet_id is None:
-                return
-
-            # Apply enhanced table formatting
-            self.sheets.format_table_layout(
-                tab_name=TAB_STATUS,
-                n_cols=len(HEADERS_STATUS),
-                last_row=1000,  # Format up to 1000 rows
-                header_row=True,
-                auto_resize=True,
-                wrap_strategy_body="CLIP",
-                header_height=35,  # Slightly taller header
-                body_row_height=25,  # Slightly taller body rows for better readability
-            )
-
-            start_row_index = 1  # row 2
-            start_col_index = 0  # A
-            end_col_index = len(HEADERS_STATUS)  # A..L
-            state_col_in_range = 3  # D within A..L
-
-            # Enhanced conditional formatting rules with better colors
-            rules = [
-                self.sheets.build_conditional_format_rule_text_equals(
-                    sheet_id=sheet_id,
-                    start_row_index=start_row_index,
-                    start_col_index=start_col_index,
-                    end_col_index=end_col_index,
-                    eval_col_index_in_range=state_col_in_range,
-                    equals_text="FAILED",
-                    background_rgb=(0.96, 0.80, 0.80),  # Softer red
-                ),
-                self.sheets.build_conditional_format_rule_text_equals(
-                    sheet_id=sheet_id,
-                    start_row_index=start_row_index,
-                    start_col_index=start_col_index,
-                    end_col_index=end_col_index,
-                    eval_col_index_in_range=state_col_in_range,
-                    equals_text="RUNNING",
-                    background_rgb=(1.0, 0.95, 0.70),  # Warmer yellow
-                ),
-                self.sheets.build_conditional_format_rule_text_equals(
-                    sheet_id=sheet_id,
-                    start_row_index=start_row_index,
-                    start_col_index=start_col_index,
-                    end_col_index=end_col_index,
-                    eval_col_index_in_range=state_col_in_range,
-                    equals_text="SUCCEEDED",
-                    background_rgb=(0.80, 0.92, 0.80),  # Softer green
-                ),
-                self.sheets.build_conditional_format_rule_text_equals(
-                    sheet_id=sheet_id,
-                    start_row_index=start_row_index,
-                    start_col_index=start_col_index,
-                    end_col_index=end_col_index,
-                    eval_col_index_in_range=state_col_in_range,
-                    equals_text="QUEUED",
-                    background_rgb=(0.90, 0.90, 0.95),  # Light blue-gray
-                ),
-            ]
-
-            self.sheets.replace_conditional_format_rules(tab_name=TAB_STATUS, rules=rules)
-
-            # Apply additional formatting for better readability
-            self._apply_column_specific_formatting(sheet_id)
+            # One-time setup: create tab, write headers, set formatting, add conditional rules
+            self._setup_tab_once()
+            
+            # Clean up any existing duplicates on first initialization
+            self.cleanup_duplicates()
             
             _FORMAT_APPLIED.add(key)
+            self._is_ready = True
 
         except Exception:
-            logger.exception("TOOL_STATUS_FORMATTING_FAILED")
+            logger.exception("TOOL_STATUS_SETUP_FAILED")
+            self._is_ready = True  # Don't retry on every write
 
-    def _apply_column_specific_formatting(self, sheet_id: int) -> None:
+    def _setup_tab_once(self) -> None:
         """
-        Apply column-specific formatting for better readability.
+        One-time setup using a single batchUpdate call.
+        Sets column widths, row heights, header formatting, conditional formatting, and hides extra columns.
         """
+        sheet_id = self.sheets.get_sheet_id(TAB_STATUS)
+        
+        # If tab doesn't exist, create it first
+        if sheet_id is None:
+            self.sheets.ensure_tab(TAB_STATUS)
+            time.sleep(0.2)  # Brief pause after creation
+            sheet_id = self.sheets.get_sheet_id(TAB_STATUS)
+            if sheet_id is None:
+                logger.warning("Failed to get sheet_id for Tool_Status")
+                return
+
+        # Build all requests for a single batchUpdate
+        requests = []
+
+        # 1. Set fixed column widths: Tool/State/Progress = 140px, Request ID/Job ID = 320px
+        column_widths = [140, 140, 140, 320, 320]  # Tool, State, Progress, Request ID, Job ID
+        for col_idx, width in enumerate(column_widths):
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_idx,
+                        "endIndex": col_idx + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            })
+
+        # 2. Set row heights: header = 35px, data rows = 30px
+        # Header row (row 1)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 35},
+                "fields": "pixelSize",
+            }
+        })
+        
+        # Data rows (rows 2-1000)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 1,
+                    "endIndex": 1000,
+                },
+                "properties": {"pixelSize": 30},
+                "fields": "pixelSize",
+            }
+        })
+
+        # 3. Format header row: bold, light gray (#F1F3F4), centered
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(HEADERS_STATUS),
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.945,    # #F1F3F4
+                            "green": 0.953,
+                            "blue": 0.957
+                        },
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "textFormat": {
+                            "fontSize": 10,
+                            "bold": True
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)",
+            }
+        })
+
+        # 4. Hide columns F onwards (column index 5+)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 5,  # Column F (0-indexed)
+                    "endIndex": 26,   # Hide through column Z
+                },
+                "properties": {"hiddenByUser": True},
+                "fields": "hiddenByUser",
+            }
+        })
+
+        # 5. Add conditional formatting rules
+        # Rule 1 (lowest priority): Yellow for all data rows (default for RUNNING and other states)
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(HEADERS_STATUS),
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": "=TRUE"}]  # Always true = default yellow
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.70}  # Yellow
+                        }
+                    }
+                },
+                "index": 2  # Lowest priority
+            }
+        })
+
+        # Rule 2 (medium priority): Green for SUCCEEDED
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(HEADERS_STATUS),
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=$B2="SUCCEEDED"'}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.80, "green": 0.92, "blue": 0.80}  # Green
+                        }
+                    }
+                },
+                "index": 1  # Medium priority
+            }
+        })
+
+        # Rule 3 (highest priority): Red for FAILED
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(HEADERS_STATUS),
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "CUSTOM_FORMULA",
+                            "values": [{"userEnteredValue": '=$B2="FAILED"'}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.96, "green": 0.80, "blue": 0.80}  # Red
+                        }
+                    }
+                },
+                "index": 0  # Highest priority
+            }
+        })
+
+        # Execute single batchUpdate with all formatting
         try:
-            # Format Job ID column (A) - left align, monospace-like
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=0,  # Job ID
-                end_col_index=1,
-                horizontal_align="LEFT",
-                vertical_align="MIDDLE",
-            )
+            self.sheets._service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body={"requests": requests}
+            ).execute()
+            logger.debug("TOOL_STATUS_BATCH_FORMAT_SUCCESS | requests=%d", len(requests))
+        except Exception as e:
+            logger.warning("TOOL_STATUS_BATCH_FORMAT_FAILED | error=%s", e)
 
-            # Format Tool column (B) - center align
-            self.sheets.format_cells(
+        # Write header row values separately (values API)
+        try:
+            self.sheets.write_range(
                 tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=1,  # Tool
-                end_col_index=2,
-                horizontal_align="CENTER",
-                vertical_align="MIDDLE",
+                start_cell="A1",
+                values=[list(HEADERS_STATUS)]
             )
-
-            # Format State column (D) - center align, bold
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=3,  # State
-                end_col_index=4,
-                horizontal_align="CENTER",
-                vertical_align="MIDDLE",
-                bold=True,
-            )
-
-            # Format Phase column (E) - center align
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=4,  # Phase
-                end_col_index=5,
-                horizontal_align="CENTER",
-                vertical_align="MIDDLE",
-            )
-
-            # Format Current/Total/Percent columns (F,G,H) - right align for numbers
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=5,  # Current
-                end_col_index=8,    # Through Percent
-                horizontal_align="RIGHT",
-                vertical_align="MIDDLE",
-            )
-
-            # Format Message column (I) - left align, wrap text
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=8,  # Message
-                end_col_index=9,
-                horizontal_align="LEFT",
-                vertical_align="MIDDLE",
-                wrap_strategy="WRAP",
-            )
-
-            # Format Updated At column (J) - center align
-            self.sheets.format_cells(
-                tab_name=TAB_STATUS,
-                start_row_index=1,
-                end_row_index=1000,
-                start_col_index=9,  # Updated At
-                end_col_index=10,
-                horizontal_align="CENTER",
-                vertical_align="MIDDLE",
-            )
-
-        except Exception as exc:
-            logger.warning("COLUMN_SPECIFIC_FORMATTING_FAILED | error=%s", exc)
+        except Exception as e:
+            logger.warning("TOOL_STATUS_HEADER_WRITE_FAILED | error=%s", e)
 
     # ---------------------------------------------------------------------
     # Row allocation
@@ -265,7 +328,8 @@ class ToolStatusWriter:
         end = start + int(self.scan_max_rows) - 1
 
         try:
-            values = self.sheets.read_range(tab_name=TAB_STATUS, a1_range=f"A{start}:A{end}")
+            # Job ID is now in column E (index 4)
+            values = self.sheets.read_range(tab_name=TAB_STATUS, a1_range=f"E{start}:E{end}")
         except Exception:
             return None
 
@@ -282,13 +346,14 @@ class ToolStatusWriter:
         """
         Clean up any duplicate job entries in the Tool_Status sheet.
         This is a maintenance operation to fix any existing duplicates.
+        New format: Tool | State | Progress | Request ID | Job ID
         """
         try:
             start = int(self.scan_start_row)
             end = start + int(self.scan_max_rows) - 1
             
-            # Read all data from the sheet
-            all_data = self.sheets.read_range(tab_name=TAB_STATUS, a1_range=f"A{start}:L{end}")
+            # Read all data from the sheet (now only 5 columns: A-E)
+            all_data = self.sheets.read_range(tab_name=TAB_STATUS, a1_range=f"A{start}:E{end}")
             
             if not all_data:
                 return
@@ -298,44 +363,29 @@ class ToolStatusWriter:
             rows_to_keep: list[list[str]] = []
             
             for i, row in enumerate(all_data):
-                if not row or not row[0].strip():
+                if not row or len(row) < 5:
                     continue
-                    
-                job_id = norm(row[0])
+                
+                # Job ID is now in column E (index 4)
+                job_id = norm(row[4]) if len(row) > 4 else ""
                 if not job_id:
                     continue
                 
                 current_row_index = start + i
                 
                 if job_id in seen_jobs:
-                    # Duplicate found - keep the one with more recent data
+                    # Duplicate found - keep the most recent one
+                    # Since we don't have timestamps anymore, keep the first occurrence
                     existing_row_index, existing_row_data = seen_jobs[job_id]
-                    
-                    # Compare "Updated At" timestamps (column J, index 9)
-                    current_updated = row[9] if len(row) > 9 else ""
-                    existing_updated = existing_row_data[9] if len(existing_row_data) > 9 else ""
-                    
-                    # Keep the row with the more recent timestamp
-                    if current_updated > existing_updated:
-                        # Replace the existing entry with current one
-                        seen_jobs[job_id] = (current_row_index, row)
-                        # Remove the old entry from rows_to_keep
-                        rows_to_keep = [r for r in rows_to_keep if r != existing_row_data]
-                        rows_to_keep.append(row)
-                        logger.info("CLEANUP_DUPLICATE | job_id=%s | kept_newer=%s | removed_older=%s",
-                                  job_id, current_updated, existing_updated)
-                    else:
-                        # Keep the existing entry, skip current
-                        logger.info("CLEANUP_DUPLICATE | job_id=%s | kept_existing=%s | skipped_older=%s",
-                                  job_id, existing_updated, current_updated)
+                    logger.debug("CLEANUP_DUPLICATE | job_id=%s | keeping_first_occurrence", job_id)
                 else:
                     # First occurrence of this job ID
                     seen_jobs[job_id] = (current_row_index, row)
                     rows_to_keep.append(row)
             
             # If we found duplicates, rewrite the sheet with cleaned data
-            if len(rows_to_keep) < len([r for r in all_data if r and r[0].strip()]):
-                logger.info("CLEANUP_DUPLICATES | original_rows=%d | cleaned_rows=%d",
+            if len(rows_to_keep) < len([r for r in all_data if r and len(r) >= 5 and r[4].strip()]):
+                logger.debug("CLEANUP_DUPLICATES | original_rows=%d | cleaned_rows=%d",
                           len(all_data), len(rows_to_keep))
                 
                 # Clear the data area and rewrite with cleaned data
@@ -353,6 +403,7 @@ class ToolStatusWriter:
         Allocate a dedicated row for job_id.
 
         If new, append `initial_row` (must match HEADERS_STATUS length) so State is set immediately.
+        New format: Tool | State | Progress | Request ID | Job ID
         """
         jid = norm(job_id)
         if not jid:
@@ -370,8 +421,8 @@ class ToolStatusWriter:
         if initial_row and len(initial_row) == len(HEADERS_STATUS):
             row_to_append = initial_row
         else:
-            # fallback placeholder (should be rare now)
-            row_to_append = [jid] + [""] * (len(HEADERS_STATUS) - 1)
+            # fallback placeholder: Tool | State | Progress | Request ID | Job ID
+            row_to_append = ["", "", "", "", jid]
 
         resp = self.sheets.append_rows(tab_name=TAB_STATUS, rows=[row_to_append])
         row_idx = SheetsClient.parse_row_from_append_response(resp)
@@ -390,20 +441,15 @@ class ToolStatusWriter:
         self,
         *,
         state: str,
-        phase: str | None,
         current: int | None,
         total: int | None,
-        message: str | None,
-        meta: dict[str, Any] | None,
     ) -> str:
+        """Generate signature for change detection. Simplified for new format."""
         return "|".join(
             [
                 norm(state),
-                norm(phase),
                 str(current if current is not None else ""),
                 str(total if total is not None else ""),
-                norm(message),
-                json.dumps(meta or {}, ensure_ascii=False, sort_keys=True),
             ]
         )
 
@@ -438,36 +484,31 @@ class ToolStatusWriter:
         meta: dict[str, Any] | None = None,
         force: bool = False,
     ) -> None:
+        """
+        Write status to sheet using values-only updates.
+        New format: Tool | State | Progress | Request ID | Job ID
+        Note: phase, message, and meta are ignored in the new simplified format
+        """
         self.ensure_ready(force_format=force)
 
         jid = norm(job_id)
-        sid = norm(self.spreadsheet_id)
 
-        updated_at = datetime.utcnow().isoformat()
-        pct = _percent(current, total)
+        # Normalize tool name for display
+        tool_display = _normalize_tool_name(tool)
+        progress = _progress_format(current, total)
 
         row = [
-            jid,
-            norm(tool),
-            norm(request_id),
+            tool_display,
             norm(state),
-            norm(phase),
-            str(current if current is not None else ""),
-            str(total if total is not None else ""),
-            pct,
-            norm(message),
-            updated_at,
-            sid,
-            json.dumps(meta or {}, ensure_ascii=False),
+            progress,
+            norm(request_id),
+            jid,
         ]
 
         sig = self._signature(
             state=state,
-            phase=phase,
             current=current,
             total=total,
-            message=message,
-            meta=meta,
         )
         if not self._should_write(job_id=jid, state=state, signature=sig, force=force):
             return
@@ -475,6 +516,7 @@ class ToolStatusWriter:
         # Allocate row; for first-time allocation append FULL row so it is colored immediately
         row_idx = self.allocate_row(job_id=jid, initial_row=row)
 
+        # Values-only update (no formatting calls)
         if self.manager and row_idx > 0:
             self.manager.queue_values_update(tab_name=TAB_STATUS, a1_range=f"A{row_idx}", values=[row])
         else:

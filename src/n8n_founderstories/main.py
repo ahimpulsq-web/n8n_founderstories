@@ -35,6 +35,7 @@ def create_app() -> FastAPI:
 
     _register_exception_handlers(app)
     _register_routes(app)
+    _register_startup_events(app)
 
     return app
 
@@ -72,6 +73,15 @@ def _register_exception_handlers(app: FastAPI) -> None:
 def _register_routes(app: FastAPI) -> None:
     """Attach API routers."""
     app.include_router(api_v1_router, prefix=settings.api_v1_prefix)
+
+
+def _register_startup_events(app: FastAPI) -> None:
+    """Register startup event handlers."""
+    @app.on_event("startup")
+    async def startup_event():
+        """Log application ready message on startup."""
+        url = f"http://{settings.host}:{settings.port}"
+        logger.info(f"SYSTEM | Application ready ({url})")
 
 
 # -------------------------------------------------------------------------

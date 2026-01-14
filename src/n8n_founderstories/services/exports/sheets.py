@@ -172,7 +172,7 @@ class SheetsClient:
             "https://www.googleapis.com/auth/spreadsheets"
         ]
         creds = Credentials.from_service_account_file(service_account_file, scopes=scopes)
-        logger.debug("SHEETS_CLIENT_INIT | scopes=%s | creds=%s", scopes, type(creds).__name__)
+        logger.info("SHEETS_CLIENT_INIT | scopes=%s | creds=%s", scopes, type(creds).__name__)
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
     def _execute_with_retry(

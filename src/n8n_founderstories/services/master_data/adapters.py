@@ -135,7 +135,7 @@ class BaseSourceAdapter(ABC):
                             if new_watermark is None or row_dict[watermark_column] > new_watermark:
                                 new_watermark = row_dict[watermark_column]
                     
-                    logger.info(
+                    logger.debug(
                         "Fetched %d rows from %s (request_id=%s, watermark_col=%s, watermark=%s)",
                         len(rows),
                         self.source_table_name,

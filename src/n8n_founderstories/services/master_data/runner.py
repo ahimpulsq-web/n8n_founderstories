@@ -23,10 +23,13 @@ from ..jobs.models import JobState
 from ..jobs.sheets_status import ToolStatusWriter
 from ..jobs.store import find_job_by_request_and_tool, mark_failed, mark_running, mark_succeeded, update_progress
 from ..exports.sheets import SheetsClient, default_sheets_config
+from ..exports.sheets_exporter import export_master_results
 
 from .adapters import BaseSourceAdapter, get_available_adapters, get_adapter_by_name
 from .models import MasterRow
 from .repos import MasterResultsRepository, MasterWatermarkRepository, PermanentError
+from ..company_enrichment.runner import run_company_enrichment_for_request
+
 
 
 logger = logging.getLogger(__name__)
@@ -35,27 +38,6 @@ logger = logging.getLogger(__name__)
 def _utc_now_iso() -> str:
     """Return current UTC time as ISO string."""
     return datetime.now(timezone.utc).isoformat()
-def _convert_results_to_sheets_format(results: List[dict]) -> List[List[str]]:
-    """
-    Convert DB results to Sheets row format (3-column: organisation, domain, source).
-    
-    Args:
-        results: List of master_results dictionaries from DB
-        
-    Returns:
-        List of rows in Sheets format with 3 columns
-    """
-    sheets_rows = []
-    
-    for result in results:
-        row = [
-            norm(result.get('company', '')),      # Organisation
-            norm(result.get('domain', '')),       # Domain (can be empty)
-            norm(result.get('source_tool', '')),  # Source
-        ]
-        sheets_rows.append(row)
-    
-    return sheets_rows
 
 
 def _create_audit_rows(*, request_id: str, results: List[dict]) -> List[List[str]]:
@@ -110,6 +92,8 @@ def _create_audit_rows(*, request_id: str, results: List[dict]) -> List[List[str
         audit_rows.append(row)
     
     return audit_rows
+
+
 
 
 def _has_data_for_request(request_id: str, adapters: List[BaseSourceAdapter]) -> bool:
@@ -216,7 +200,7 @@ def _has_new_data_after_watermarks(
             continue
     
     # No adapter has new data
-    log.info("MASTER_DELTA_CHECK_COMPLETE | has_new_data=false | checked_tools=%d", len(adapters))
+    log.info("MASTER | \LDELTA_CHECK_COMPLETE | has_new_data=false | checked_tools=%d", len(adapters))
     return False, None
 
 
@@ -289,7 +273,7 @@ def run_master_job_db_first_with_rerun(
             
             if not was_pending:
                 # No pending triggers - we're done
-                log.info("MASTER_COMPLETE | request_id=%s | reruns=%d", rid, rerun_count)
+                log.info("MASTER | \LCOMPLETE | request_id=%s | reruns=%d", rid, rerun_count)
                 break
             
             # Pending flag was set - perform delta check before rerunning
@@ -462,7 +446,7 @@ def run_master_job_db_first(
             if lock_conn_or_error is None:
                 # Lock is held by another Master process - this is normal
                 msg = "Master lock busy for this request_id - another Master is running"
-                log.info("MASTER_LOCK_BUSY | request_id=%s | skipping", rid)
+                log.info("MASTER | \LLOCK_BUSY | request_id=%s | skipping", rid)
                 mark_succeeded(job_id, message=msg, metrics={"skipped": True, "reason": "lock_busy"})
             else:
                 # Error acquiring lock
@@ -497,7 +481,7 @@ def run_master_job_db_first(
                 adapter = get_adapter_by_name(tool_name)
                 if adapter and adapter.table_exists():
                     adapters.append(adapter)
-                    log.info("MASTER_ADAPTER_ENABLED | tool=%s | table=%s", tool_name, adapter.source_table_name)
+                    log.info("MASTER | \LADAPTER_ENABLED | tool=%s | table=%s", tool_name, adapter.source_table_name)
                 else:
                     log.warning("MASTER_ADAPTER_SKIPPED | tool=%s | reason=table_not_found", tool_name)
         else:
@@ -507,7 +491,7 @@ def run_master_job_db_first(
         # Peek check: Exit early if no data exists yet (avoids noisy runs)
         if not adapters:
             msg = "No source tools available"
-            log.info("MASTER_NO_ADAPTERS | request_id=%s | reason=no_tables", rid)
+            log.info("MASTER | \LNO_ADAPTERS | request_id=%s | reason=no_tables", rid)
             mark_succeeded(job_id, message=msg, metrics={"adapters": 0, "total_ingested": 0, "reason": "no_tables"})
             if status:
                 status.write(
@@ -529,7 +513,7 @@ def run_master_job_db_first(
         
         if not has_data:
             msg = "No data found yet - tools haven't persisted data"
-            log.info("MASTER_NO_DATA_YET | request_id=%s | adapters=%d", rid, len(adapters))
+            log.info("MASTER | \LNO_DATA_YET | request_id=%s | adapters=%d", rid, len(adapters))
             mark_succeeded(job_id, message=msg, metrics={"adapters": len(adapters), "total_ingested": 0, "reason": "no_data_yet"})
             if status:
                 status.write(
@@ -566,7 +550,7 @@ def run_master_job_db_first(
         
         if not adapters:
             msg = "No adapters with data found"
-            log.info("MASTER_NO_ADAPTERS | request_id=%s | reason=no_data", rid)
+            log.info("MASTER | \LNO_ADAPTERS | request_id=%s | reason=no_data", rid)
             mark_succeeded(job_id, message=msg, metrics={"adapters": 0, "total_ingested": 0, "reason": "no_data"})
             if status:
                 status.write(
@@ -584,7 +568,7 @@ def run_master_job_db_first(
             return
         
         total_adapters = len(adapters)
-        log.info("MASTER_SINGLE_PASS_START | request_id=%s | adapters=%d | tools=%s", rid, total_adapters, [a.source_tool_name for a in adapters])
+        log.info("MASTER | \LSINGLE_PASS_START | request_id=%s | adapters=%d | tools=%s", rid, total_adapters, [a.source_tool_name for a in adapters])
         
         update_progress(
             job_id,
@@ -639,7 +623,7 @@ def run_master_job_db_first(
                 continue
             
             if not source_rows:
-                log.info("MASTER_NO_NEW_ROWS | tool=%s | watermark=%s", tool_name, watermark)
+                log.info("MASTER | \LNO_NEW_ROWS | tool=%s | watermark=%s", tool_name, watermark)
                 continue
             
             # Normalize rows to Master schema
@@ -675,7 +659,7 @@ def run_master_job_db_first(
                 continue
             
             if no_domain_rows > 0:
-                log.info("MASTER_NO_DOMAIN_ROWS | tool=%s | no_domain=%d | total=%d", tool_name, no_domain_rows, len(master_rows))
+                log.info("MASTER | \LNO_DOMAIN_ROWS | tool=%s | no_domain=%d | total=%d", tool_name, no_domain_rows, len(master_rows))
             
             # Upsert into master_results with fail-fast on permanent errors
             try:
@@ -724,11 +708,12 @@ def run_master_job_db_first(
                 },
             )
         
-        log.info("MASTER_SINGLE_PASS_COMPLETE | request_id=%s | total_ingested=%d | tools=%s", rid, total_ingested, list(ingested_by_tool.keys()))
-        
-        # Export to Sheets only if data was ingested and export is enabled
-        if export_to_sheets and settings.master_sheets_export_enabled and total_ingested > 0:
-            log.info("MASTER_EXPORT_START | request_id=%s", rid)
+        log.info("MASTER | \LSINGLE_PASS_COMPLETE | request_id=%s | total_ingested=%d | tools=%s", rid, total_ingested, list(ingested_by_tool.keys()))
+
+        # Export to Sheets FIRST (before enrichment)
+        # This ensures rows exist in Sheets before enrichment tries to update them
+        if export_to_sheets and settings.master_sheets_export_enabled:
+            log.info("MASTER | \LEXPORT_START | request_id=%s | total_ingested=%d", rid, total_ingested)
             
             update_progress(
                 job_id,
@@ -740,39 +725,54 @@ def run_master_job_db_first(
             )
             
             try:
-                from ..exports.sheets_exporter import export_master_results
-                
-                # Fetch results from DB
-                repo = MasterResultsRepository()
-                success, error, results = repo.get_results_by_request(request_id=rid)
+                # Fetch all results for this request from DB
+                success, error, results = results_repo.get_results_by_request(request_id=rid)
                 
                 if not success:
-                    raise RuntimeError(f"Failed to fetch master results: {error}")
-                
-                if not results:
-                    log.warning("MASTER_EXPORT_NO_RESULTS | request_id=%s", rid)
+                    log.error("MASTER_EXPORT_FETCH_FAILED | error=%s", error)
                 else:
-                    # Convert results to Sheets format
-                    results_rows = _convert_results_to_sheets_format(results)
+                    # Convert DB results to Sheets format (Master-owned fields only)
+                    # Enrichment columns (Emails, Contacts, Extraction Status, Debug Message)
+                    # will be empty initially and updated incrementally by enrichment_sheets_sync
+                    sheets_rows = []
+                    for result in results:
+                        # Build row with all 8 columns matching HEADERS_MASTER_MAIN
+                        # Column 0: master_result_id (stable row key for deterministic matching)
+                        # Columns 1-3: Master-owned fields
+                        # Columns 4-7: Enrichment fields (empty, updated by enrichment sync)
+                        row = [
+                            str(result.get('id', '')),                 # master_result_id (row key)
+                            norm(result.get('company', '')),           # Organisation
+                            norm(result.get('domain', '')),            # Domain
+                            norm(result.get('source_tool', '')),       # Source
+                            '',                                         # Emails (enrichment)
+                            '',                                         # Contacts (enrichment)
+                            '',                                         # Extraction Status (enrichment)
+                            '',                                         # Debug Message (enrichment)
+                        ]
+                        sheets_rows.append(row)
                     
-                    # Create audit statistics
+                    # Create audit rows
                     audit_rows = _create_audit_rows(request_id=rid, results=results)
                     
-                    # Export using centralized function
+                    # Export to Sheets
                     export_master_results(
                         client=sheets,
                         job_id=job_id,
                         request_id=rid,
-                        results_rows=results_rows,
+                        results_rows=sheets_rows,
                         audit_rows=audit_rows,
                     )
-                    
-                    log.info("MASTER_EXPORT_COMPLETE | request_id=%s | rows=%d", rid, len(results_rows))
+                    log.info("MASTER | \LEXPORT_COMPLETE | request_id=%s | rows=%d", rid, len(sheets_rows))
             except Exception as e:
                 log.error("MASTER_EXPORT_FAILED | error=%s", e, exc_info=True)
                 # Don't fail the job if export fails
+        elif not export_to_sheets:
+            log.info("MASTER_EXPORT_SKIPPED | reason=export_to_sheets_disabled | request_id=%s", rid)
+        elif not settings.master_sheets_export_enabled:
+            log.info("MASTER_EXPORT_SKIPPED | reason=master_sheets_export_disabled | request_id=%s", rid)
         
-        # Job succeeded
+        # Job succeeded - mark Master as SUCCEEDED before dispatching enrichment
         msg = f"Master single-pass ingestion completed. Ingested {total_ingested} rows from {len(ingested_by_tool)} tools."
         mark_succeeded(
             job_id,
@@ -785,7 +785,7 @@ def run_master_job_db_first(
             }
         )
         
-        log.info("JOB_SUCCEEDED | %s", msg)
+        log.info("MASTER | SUCCEEDED | %s", msg)
         
         if status:
             status.write(
@@ -803,6 +803,32 @@ def run_master_job_db_first(
                     "single_pass": True,
                 },
                 force=True,
+            )
+        
+        # AFTER Master is marked SUCCEEDED, dispatch enrichment as separate job
+        # This ensures enrichment runs independently and Master status is not affected by enrichment failures
+        try:
+            from ..background_jobs import submit_job
+            from .._dispatch_enrichment import dispatch_enrichment_job
+            
+            log.info("MASTER | DISPATCHING_ENRICHMENT | request_id=%s | spreadsheet_id=%s", rid, sid)
+            
+            # Dispatch enrichment job asynchronously
+            submit_job(
+                dispatch_enrichment_job,
+                request_id=rid,
+                spreadsheet_id=sid,
+            )
+            
+            log.info("MASTER | ENRICHMENT_DISPATCHED | request_id=%s", rid)
+            
+        except Exception as e:
+            # Log error but do not fail Master job - it already succeeded
+            log.error(
+                "MASTER | ENRICHMENT_DISPATCH_FAILED | request_id=%s | error=%s",
+                rid,
+                e,
+                exc_info=True
             )
     
     except Exception as exc:
