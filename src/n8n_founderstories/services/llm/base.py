@@ -57,12 +57,12 @@ def get_llm_client(provider: str | None = None) -> LLMClient:
     effective = (provider or settings.llm_provider or "groq").strip().lower()
 
     if effective in {"groq", "groq-llama3", "llama3"}:
-        logger.info("LLM_FACTORY | provider=%s", effective)
+        logger.debug("LLM_FACTORY | provider=%s", effective)
         from .groq_client import GroqLLMClient
         return GroqLLMClient()
 
     if effective in {"gemini", "google"}:
-        logger.info("LLM_FACTORY | provider=%s", effective)
+        logger.debug("LLM_FACTORY | provider=%s", effective)
         from .gemini_client import GeminiLLMClient
         return GeminiLLMClient()
 

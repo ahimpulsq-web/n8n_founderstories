@@ -834,7 +834,7 @@ def run_hunter_job(
                     results_rows=sheets_rows,
                     audit_rows=audit_sheets_rows if audit_sheets_rows else None,
                 )
-                log.info(f"SHEETS_EXPORT | tool=hunter | results={len(sheets_rows)} | audit={len(audit_sheets_rows)}")
+                log.info(f"HUNTERIO | sheets_export | results={len(sheets_rows)} | audit={len(audit_sheets_rows)}")
                     
             except Exception as e:
                 log.error(f"SHEETS_EXPORT | Failed: {e}")

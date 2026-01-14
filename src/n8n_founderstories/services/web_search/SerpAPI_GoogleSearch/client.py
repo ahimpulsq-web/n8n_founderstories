@@ -223,7 +223,7 @@ class SerpApiClient:
                             )
                         )
 
-                logger.info(
+                logger.debug(
                     "SERPAPI_OK | id=%s | q=%r | gl=%s | hl=%s | domain=%s | results=%d",
                     request_id,
                     q[:120],

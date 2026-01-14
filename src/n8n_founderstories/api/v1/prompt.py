@@ -99,7 +99,7 @@ async def receive_prompt(payload: PromptRequest) -> PromptResponse:
     sheet_title = _build_sheet_title(prompt)
     provider = _get_llm_provider(payload.llm_provider)
 
-    logger.info("PROMPT_RECEIVED | prompt=%r | provider=%s", prompt, provider)
+    logger.info("PROMPT | prompt_received | prompt=%r | provider=%s", prompt, provider)
 
     # ------------------------------------------------------------------------
     # Core operation (build SearchPlan)

@@ -140,3 +140,29 @@ src/n8n_founderstories/services/outreach/hunterio/runner_refactored_example.py
 
 # Tests (temporary ignore – re-enable later)
 tests/
+
+
+# Local experiments / prototypes
+crawlaitest/
+email_finder_prototype/
+company_data_extractor/   # root-level accidental copies
+src (7).zip
+
+# Local design / refactor notes (use docs/ instead)
+ENRICHMENT_REFACTORING.md
+*_REFACTORING.md
+*_SUMMARY.md
+*_IMPLEMENTATION*.md
+
+
+# Accidental archives
+*.zip
+*.tar
+*.tar.gz
+
+# AI / crawler test artifacts
+crawl4ai/
+crawl4ai_test/
+
+# Local dispatch / scratch scripts
+src/n8n_founderstories/services/_dispatch_*.py

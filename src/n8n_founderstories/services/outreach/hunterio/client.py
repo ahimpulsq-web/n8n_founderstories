@@ -156,7 +156,7 @@ class HunterClient:
             raise ValueError("Hunter discover requires either query or at least one filter.")
 
         url = f"{self._base_url}/discover"
-        logger.info("HUNTER_DISCOVER_REQUEST | payload=%s", payload)
+        logger.debug("HUNTER_DISCOVER_REQUEST | payload=%s", payload)
 
         resp = self._http.post(url, params={"api_key": self._api_key}, json=payload)
         resp.raise_for_status()

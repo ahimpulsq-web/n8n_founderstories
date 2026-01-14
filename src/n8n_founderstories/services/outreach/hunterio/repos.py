@@ -224,7 +224,7 @@ class HunterIOResultsRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d Hunter.io results to PostgreSQL",
                         inserted_count
                     )
@@ -366,7 +366,7 @@ class HunterAuditRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d Hunter audit records to PostgreSQL",
                         inserted_count
                     )
@@ -525,7 +525,7 @@ class HunterIOBatchProcessor:
         self._results_batch_size = settings.hunter_db_batch_size_results
         self._audit_batch_size = settings.hunter_db_batch_size_audit
         
-        logger.info(
+        logger.debug(
             "Initialized Hunter.io batch processor (job_id=%s, request_id=%s, "
             "results_batch_size=%d, audit_batch_size=%d)",
             job_id, request_id, self._results_batch_size, self._audit_batch_size
@@ -576,7 +576,7 @@ class HunterIOBatchProcessor:
             success, error, count = self._results_repo.insert_many(self._results_buffer)
             
             if success:
-                logger.info(
+                logger.debug(
                     "Batch flushed %d Hunter.io results to PostgreSQL "
                     "(job_id=%s, request_id=%s)",
                     count, self.job_id, self.request_id
@@ -609,7 +609,7 @@ class HunterIOBatchProcessor:
             success, error, count = self._audit_repo.insert_many(self._audit_buffer)
             
             if success:
-                logger.info(
+                logger.debug(
                     "Batch flushed %d Hunter audit records to PostgreSQL "
                     "(job_id=%s, request_id=%s)",
                     count, self.job_id, self.request_id

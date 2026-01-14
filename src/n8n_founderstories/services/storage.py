@@ -329,7 +329,7 @@ def save_artifact(
         # Primary artifact write (critical)
         _atomic_write_json(file_path, serializable)
 
-        logger.info(
+        logger.debug(
             "ARTIFACT_SAVED | category=%s | provider=%s | kind=%s | request_id=%s | path=%s",
             category_slug,
             provider_slug,

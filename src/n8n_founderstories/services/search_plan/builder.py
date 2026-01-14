@@ -124,7 +124,7 @@ def build_search_plan(
     )
 
     logger.info(
-        "SEARCH_PLAN_BUILT | request_id=%s | provider=%s | industry=%s | geo=%s | geo_mode=%s | sources=%s",
+        "PROMPT | search_plan_built | request_id=%s | provider=%s | industry=%s | geo=%s | geo_mode=%s | sources=%s",
         request_id,
         plan.provider_name,
         plan.industry,

@@ -339,7 +339,7 @@ class GoogleMapsResultsRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d Google Maps results to PostgreSQL",
                         inserted_count
                     )
@@ -543,7 +543,7 @@ class GoogleMapsResultsRepository:
                     conn.commit()
                     
                     rows_updated = cur.rowcount
-                    logger.info(
+                    logger.debug(
                         "Updated contact fields for place_id=%s (rows=%d)",
                         place_id,
                         rows_updated
@@ -626,7 +626,7 @@ class GoogleMapsEnrichedRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d Google Maps enriched records to PostgreSQL",
                         inserted_count
                     )
@@ -851,7 +851,7 @@ class GoogleMapsEnrichQueueRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d enrichment queue items to PostgreSQL",
                         inserted_count
                     )
@@ -955,7 +955,7 @@ class GoogleMapsEnrichQueueRepository:
                         })
                     
                     if items:
-                        logger.info(
+                        logger.debug(
                             "QUEUE_FETCH | job_id=%s request_id=%s | claimed=%d items",
                             job_id,
                             request_id,
@@ -1009,7 +1009,7 @@ class GoogleMapsEnrichQueueRepository:
                     conn.commit()
                     
                     rows_updated = cur.rowcount
-                    logger.info("QUEUE_DONE | marked=%d items as DONE", rows_updated)
+                    logger.debug("QUEUE_DONE | marked=%d items as DONE", rows_updated)
                     return True, None
                     
         except DatabaseConnectionError as e:
@@ -1083,7 +1083,7 @@ class GoogleMapsEnrichQueueRepository:
                     conn.commit()
                     
                     rows_updated = cur.rowcount
-                    logger.info(
+                    logger.debug(
                         "QUEUE_FAILED | marked=%d items | error=%s | max_attempts=%d",
                         rows_updated,
                         error[:100],
@@ -1377,7 +1377,7 @@ class GoogleMapsAuditRepository:
                     conn.commit()
                     
                     inserted_count = len(batch_data)
-                    logger.info(
+                    logger.debug(
                         "Successfully inserted %d Google Maps audit records to PostgreSQL",
                         inserted_count
                     )

@@ -444,17 +444,17 @@ def run_google_maps_discover_job(
 
         # Step 1: Always write to database first (DB-first approach)
         if db_result_rows:
-            log.info(f"DB_WRITE | tool=google_maps_discover | results={len(db_result_rows)}")
+            log.info(f"GMAPS | db_write | results={len(db_result_rows)}")
             safe_insert_google_maps_results(job_id, rid, db_result_rows)
 
         # Step 2: Write audit rows to database (DB-first audit)
         if db_audit_rows:
-            log.info(f"DB_AUDIT_WRITE | tool=google_maps_discover | audit_rows={len(db_audit_rows)}")
+            log.info(f"GMAPS | db_audit_write | audit_rows={len(db_audit_rows)}")
             safe_insert_google_maps_audit(job_id, rid, db_audit_rows)
 
         # Step 3: Write enrichment queue to database (if enrichment enabled)
         if enqueue_for_enrich and db_queue_rows:
-            log.info(f"DB_QUEUE_ENQUEUE | tool=google_maps_discover | queue_items={len(db_queue_rows)}")
+            log.info(f"GMAPS | db_queue_enqueue | queue_items={len(db_queue_rows)}")
             safe_insert_google_maps_enrich_queue(job_id, rid, db_queue_rows)
 
         # Step 4: Export to Google Sheets from database (only if export enabled)
@@ -487,7 +487,7 @@ def run_google_maps_discover_job(
                         results_rows=sheets_rows,
                         audit_rows=audit_sheets_rows if audit_sheets_rows else None,
                     )
-                    log.info(f"SHEETS_EXPORT | tool=google_maps_discover | rows={len(sheets_rows)} | audit={len(audit_sheets_rows)}")
+                    log.info(f"GMAPS | sheets_export | rows={len(sheets_rows)} | audit={len(audit_sheets_rows)}")
                 else:
                     log.warning(f"SHEETS_EXPORT | Failed to retrieve results: {error}")
                     

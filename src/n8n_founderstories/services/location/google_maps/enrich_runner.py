@@ -356,7 +356,7 @@ def run_google_maps_enrich_job(
                     results_rows=results_to_export,
                     audit_rows=None,  # Optional: include audit if needed
                 )
-                log.info(f"SHEETS_EXPORT | tool=google_maps_enrich | main_rows={len(results_to_export)}")
+                log.info(f"GMAPS | sheets_export_enrich | main_rows={len(results_to_export)}")
                     
             except Exception as e:
                 log.error(f"SHEETS_EXPORT | Failed: {e}")

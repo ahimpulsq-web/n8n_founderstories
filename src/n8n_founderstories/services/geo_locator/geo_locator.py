@@ -89,13 +89,13 @@ def resolve_geo(
 
     p = norm(prompt)
     if not p:
-        logger.info("GEO_RESOLVE_FALLBACK | reason=empty_prompt | region=%s", region)
+        logger.debug("GEO_RESOLVE_FALLBACK | reason=empty_prompt | region=%s", region)
         return _fallback(region)
 
     try:
         result = resolve(p)
     except GeoResolutionError as exc:
-        logger.info("GEO_RESOLVE_FALLBACK | reason=%s | region=%s", exc, region)
+        logger.debug("GEO_RESOLVE_FALLBACK | reason=%s | region=%s", exc, region)
         return _fallback(region)
     except Exception as exc:
         # Defensive: never let geo resolution crash upstream pipelines.
