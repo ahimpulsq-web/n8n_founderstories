@@ -25,10 +25,12 @@ httpx[http2]
 scrapy
 sqlalchemy 
 psycopg[binary]
+pytest-asyncio
 
 openai
 google-genai
 groq
+trafilatura
 
 pyhunter
 rapidfuzz 
@@ -44,4 +46,17 @@ google-auth-oauthlib
 
 crawl4ai
 playwright
-playwright install
+
+
+selectolax
+flair 
+rapidfuzz 
+regex
+
+probablepeople
+thefuzz
+PyPDF2
+pdfplumber
+pytesseract 
+pdf2image 
+pillow

@@ -79,6 +79,8 @@ logs/
 *.sql.gz
 *.tar
 *.bak
+domains.txt
+output/
 
 # =========================
 # Repo-specific generated artifacts

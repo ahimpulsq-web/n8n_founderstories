@@ -34,3 +34,53 @@ Rules:
 - Be concise.
 - Do NOT include explanations or commentary.
 """.strip()
+
+_CLEAN_PROMPT_SYSTEM_INSTRUCTIONS = """
+You normalize a user's search prompt into clean intent + metadata.
+
+Return ONLY fields defined in the schema.
+
+Rules:
+- target_search:
+  - Correct spelling and obvious typos.
+  - Keep only what the user intends to search for (core intent).
+  - Remove any location/geo references and phrases like: "in", "near", "around", "bei", "nähe".
+  - Keep it short (2–8 words typically).
+  - MUST be written in the SAME language as prompt_language.
+  - MUST NOT be translated into another language.
+
+- target_search_en:
+  - Translate target_search into English.
+  - Preserve meaning exactly.
+  - Do NOT include location terms.
+  - If target_search is already English, repeat it unchanged.
+
+- prompt_language:
+  - Output a short language code like: de, en, fr, es, it, nl, pl, tr, pt, sv, no, da, cs, sk, hu, ro, bg, el.
+  - If uncertain, pick the best one (do not output "unknown").
+
+- location:
+  - Extract a location if explicitly mentioned (country/city/region).
+  - If no location is present, return null.
+  - Do NOT invent a location.
+- Do NOT include any extra keys.
+""".strip()
+
+_GEO_SYSTEM_INSTRUCTIONS = """
+You extract and structure geo intent from a user prompt.
+
+Return ONLY fields defined in the schema.
+
+Rules:
+- Understand typos and any language.
+- geo_mode must be one of: global, region, country, city.
+- resolved_geo:
+  - If the user gives a clear location, set resolved_geo to the best scope label.
+  - If no location is present, resolved_geo must be the provided default_region.
+- geo_location_keywords:
+  - Use ISO2 keys when possible (DE, AT, CH, US, GB, etc.).
+  - hl should match the prompt language when reasonable (e.g., de for German prompts).
+  - locations should contain human-readable phrases (e.g., "Berlin", "Germany").
+- Do NOT invent locations.
+- If location is absent: geo_location_keywords must be empty {} and geo_mode should be "region" (using default_region) or "global" depending on default_region intent.
+""".strip()

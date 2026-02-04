@@ -7,15 +7,16 @@ from uuid import uuid4
 from ...core.utils.text import norm
 from ...core.utils.collections import dedupe_sources_keep_order
 
-from ..geo_locator.geo_locator import resolve_geo
-from ..llm.base import LLMClient, get_llm_client
+from ..llm.interface import LLMClient
 from ..storage import save_search_plan_output
 from .enforce_base import enforce_alternates, enforce_keywords
 from .enforce_maps import enforce_maps_queries
 from .enforce_web import enforce_web_queries
-from .models import SearchPlan, SearchPlanMeta, SearchPlanPayload, SearchPlanPayloadLLM
+from .geo_resolver_llm import resolve_geo_llm
+from .models import SearchPlan, SearchPlanMeta, SearchPlanPayload, SearchPlanPayloadLLM, CleanPromptPayloadLLM
 from .prompts import (
     _SYSTEM_INSTRUCTIONS,
+    _CLEAN_PROMPT_SYSTEM_INSTRUCTIONS,
     MAX_ALTERNATES,
     MAX_KEYWORDS,
     MAX_WEB_QUERIES,
@@ -49,15 +50,29 @@ def build_search_plan(
     if request_id is None:
         request_id = str(uuid4())
 
-    client = llm_client or get_llm_client()
+    if llm_client is None:
+        raise ValueError("llm_client is required. Caller must provide an LLMClient instance.")
+    
+    client = llm_client
 
     # -------------------------------------------------------------------------
-    # 1) System-owned geo resolution (deterministic)
+    # 0) LLM prompt cleaning (typos + language + optional location)
     # -------------------------------------------------------------------------
-    resolved_geo = resolve_geo(
+    cleaned: CleanPromptPayloadLLM = client.generate_structured(
+        user_prompt=f"User prompt: {prompt}",
+        system_instructions=_CLEAN_PROMPT_SYSTEM_INSTRUCTIONS,
+        schema_model=CleanPromptPayloadLLM,
+        temperature=0.0,
+)
+
+
+    # -------------------------------------------------------------------------
+    # 1) LLM-based geo resolution
+    # -------------------------------------------------------------------------
+    resolved_geo = resolve_geo_llm(
         prompt=prompt,
-        region=region,
-        llm_client=client,  # kept for signature compatibility
+        default_region=region,
+        llm_client=client,
     )
 
     # -------------------------------------------------------------------------
@@ -65,8 +80,12 @@ def build_search_plan(
     # -------------------------------------------------------------------------
     user_prompt = (
         f"Raw prompt: {prompt}\n\n"
-        f"Geo scope (system-owned, for context only): {resolved_geo.resolved_geo}\n"
-        f"Geo mode (system-owned, for context only): {resolved_geo.geo_mode}\n\n"
+        f"Target search (cleaned, original language): {cleaned.target_search}\n"
+        f"Target search (English): {cleaned.target_search_en}\n"
+        f"Prompt language: {cleaned.prompt_language}\n"
+        f"Location extracted: {cleaned.location or ''}\n\n"
+        f"Geo scope (LLM-owned): {resolved_geo.resolved_geo}\n"
+        f"Geo mode (LLM-owned): {resolved_geo.geo_mode}\n\n"
         "Fill the schema consistently with the above. "
         "Remember: keywords and web_queries must be geo-neutral."
     )
@@ -97,7 +116,7 @@ def build_search_plan(
         web_queries=llm_payload.web_queries or [],
         maps_queries=llm_payload.maps_queries or [],
         geo=norm(resolved_geo.resolved_geo),
-        geo_location_keywords=dict(resolved_geo.geo_location_keywords),
+        geo_location_keywords={k: v.model_dump() for k, v in resolved_geo.geo_location_keywords.items()},
     )
 
     # -------------------------------------------------------------------------
@@ -117,6 +136,10 @@ def build_search_plan(
         provider_name=getattr(
             client, "source_id", getattr(client, "provider_name", "llm")
         ),
+        target_search=cleaned.target_search,
+        target_search_en=cleaned.target_search_en,
+        prompt_language=cleaned.prompt_language,
+        location=cleaned.location,
     )
 
     plan = SearchPlan.model_validate(

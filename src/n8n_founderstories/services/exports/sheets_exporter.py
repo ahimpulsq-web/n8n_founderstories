@@ -344,7 +344,8 @@ def export_google_maps_results(
     
     Creates tabs only at export time with versioned names:
     - GoogleMaps_v2 (main results)
-    - GoogleMaps_Audit_v2 (optional audit)
+    
+    Note: Audit tabs are no longer exported as per requirements.
     
     Headers are always written explicitly from sheets_schema.py to prevent drift.
     
@@ -353,9 +354,9 @@ def export_google_maps_results(
         job_id: Job ID
         request_id: Request ID
         results_rows: Main results (already formatted for Sheets)
-        audit_rows: Optional audit rows
+        audit_rows: Optional audit rows (ignored - no longer exported)
     """
-    # Prepare exports using schema constants
+    # Prepare exports using schema constants - NO AUDIT EXPORT
     exports = [
         {
             "tab": TAB_GOOGLE_MAPS_MAIN,
@@ -363,13 +364,6 @@ def export_google_maps_results(
             "rows": results_rows
         }
     ]
-    
-    if audit_rows:
-        exports.append({
-            "tab": TAB_GOOGLE_MAPS_AUDIT,
-            "headers": HEADERS_GOOGLE_MAPS_AUDIT,
-            "rows": audit_rows
-        })
     
     # Export all tabs (tabs created only at export time)
     export_multiple_tables(client, exports)
@@ -389,7 +383,8 @@ def export_hunter_results(
     
     Creates tabs only at export time with versioned names:
     - HunterIO_v2 (main results)
-    - HunterIO_Audit_v2 (optional audit)
+    
+    Note: Audit tabs are no longer exported as per requirements.
     
     Headers are always written explicitly from sheets_schema.py to prevent drift.
     Applies one-time formatting for professional appearance.
@@ -399,9 +394,9 @@ def export_hunter_results(
         job_id: Job ID
         request_id: Request ID
         results_rows: Main results (already formatted for Sheets)
-        audit_rows: Optional audit rows
+        audit_rows: Optional audit rows (ignored - no longer exported)
     """
-    # Prepare exports using schema constants
+    # Prepare exports using schema constants - NO AUDIT EXPORT
     exports = [
         {
             "tab": TAB_HUNTER_MAIN,
@@ -410,13 +405,6 @@ def export_hunter_results(
         }
     ]
     
-    if audit_rows:
-        exports.append({
-            "tab": TAB_HUNTER_AUDIT,
-            "headers": HEADERS_HUNTER_AUDIT,
-            "rows": audit_rows
-        })
-    
     # Export all tabs (tabs created only at export time)
     export_multiple_tables(client, exports)
     
@@ -424,6 +412,183 @@ def export_hunter_results(
     format_hunter_tabs_once(client)
     
     logger.info(f"HUNTER_EXPORT_COMPLETE | job_id={job_id} | tabs={len(exports)}")
+
+
+def format_master_tabs_once(client: SheetsClient) -> None:
+    """
+    One-time formatting for Master_v2 tab using a single batchUpdate.
+    
+    Formatting specs (matching HunterIO style):
+    - Column widths:
+        * master_result_id (A): Hidden
+        * Organisation (B): 320px
+        * Domain (C): 320px
+        * Source (D): 100px
+        * Company Name (E): 320px
+        * E-mail ID (F): 320px
+        * Contact Names (G): 320px
+        * Short Company Description (H): 500px (wrapped)
+        * Long Company Description (I): 1000px (wrapped)
+    - Row heights: Header 35px, Data rows 50px
+    - Header: Bold, Grey (#F1F3F4), Font size 10
+    - Data rows: No coloring (white/default)
+    """
+    spreadsheet_id = client._spreadsheet_id
+    
+    # Check if already formatted
+    main_key = _format_guard_key(spreadsheet_id, TAB_MASTER_MAIN)
+    if main_key in _FORMATTED_TABS:
+        return
+    
+    try:
+        # Get sheet ID for Master_v2
+        main_sheet_id = client.get_sheet_id(TAB_MASTER_MAIN)
+        
+        if main_sheet_id is None:
+            logger.warning("MASTER_FORMAT_SKIP | main_sheet_not_found")
+            return
+        
+        # Build all requests for a single batchUpdate
+        requests = []
+        
+        # === Format Master_v2 (Main) ===
+        # Column widths: master_result_id will be hidden, others as specified
+        column_widths = [0, 320, 320, 100, 320, 320, 320, 500, 1000]  # A-I
+        for col_idx, width in enumerate(column_widths):
+            if width > 0:  # Skip column A (master_result_id) for now, will hide it
+                requests.append({
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": main_sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": col_idx,
+                            "endIndex": col_idx + 1,
+                        },
+                        "properties": {"pixelSize": width},
+                        "fields": "pixelSize",
+                    }
+                })
+        
+        # Hide column A (master_result_id)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,  # Column A
+                    "endIndex": 1,
+                },
+                "properties": {"hiddenByUser": True},
+                "fields": "hiddenByUser",
+            }
+        })
+        
+        # Header row height: 35px
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 0,
+                    "endIndex": 1,
+                },
+                "properties": {"pixelSize": 35},
+                "fields": "pixelSize",
+            }
+        })
+        
+        # Data rows height: 50px (rows 2-1000)
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "dimension": "ROWS",
+                    "startIndex": 1,
+                    "endIndex": 1000,
+                },
+                "properties": {"pixelSize": 50},
+                "fields": "pixelSize",
+            }
+        })
+        
+        # Format header row: Bold, Grey (#F1F3F4), Centered, Font size 10
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(HEADERS_MASTER_MAIN),
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 0.945,
+                            "green": 0.953,
+                            "blue": 0.957
+                        },
+                        "horizontalAlignment": "CENTER",
+                        "verticalAlignment": "MIDDLE",
+                        "textFormat": {
+                            "fontSize": 10,
+                            "bold": True
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)",
+            }
+        })
+        
+        # Set text wrapping for Short Company Description (column H, index 7)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "startRowIndex": 1,  # Data rows only
+                    "endRowIndex": 1000,
+                    "startColumnIndex": 7,  # Column H
+                    "endColumnIndex": 8,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "wrapStrategy": "WRAP"
+                    }
+                },
+                "fields": "userEnteredFormat.wrapStrategy",
+            }
+        })
+        
+        # Set text wrapping for Long Company Description (column I, index 8)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": main_sheet_id,
+                    "startRowIndex": 1,  # Data rows only
+                    "endRowIndex": 1000,
+                    "startColumnIndex": 8,  # Column I
+                    "endColumnIndex": 9,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "wrapStrategy": "WRAP"
+                    }
+                },
+                "fields": "userEnteredFormat.wrapStrategy",
+            }
+        })
+        
+        # Execute single batchUpdate
+        client._service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
+        
+        _FORMATTED_TABS.add(main_key)
+        logger.debug("MASTER_FORMAT_SUCCESS | tab=%s | requests=%d", TAB_MASTER_MAIN, len(requests))
+        
+    except Exception as e:
+        logger.warning("MASTER_FORMAT_FAILED | error=%s", e)
 
 
 def export_master_results(
@@ -439,18 +604,20 @@ def export_master_results(
     
     Creates tabs only at export time with versioned names:
     - Master_v2 (main results)
-    - Master_Audit_v2 (optional audit)
+    
+    Note: Audit tabs are no longer exported as per requirements.
     
     Headers are always written explicitly from sheets_schema.py to prevent drift.
+    Applies formatting with hidden master_result_id column and specific column widths.
     
     Args:
         client: SheetsClient instance
         job_id: Job ID
         request_id: Request ID
         results_rows: Main results (already formatted for Sheets)
-        audit_rows: Optional audit rows
+        audit_rows: Optional audit rows (ignored - no longer exported)
     """
-    # Prepare exports using schema constants
+    # Prepare exports using schema constants - NO AUDIT EXPORT
     exports = [
         {
             "tab": TAB_MASTER_MAIN,
@@ -459,15 +626,12 @@ def export_master_results(
         }
     ]
     
-    if audit_rows:
-        exports.append({
-            "tab": TAB_MASTER_AUDIT,
-            "headers": HEADERS_MASTER_AUDIT,
-            "rows": audit_rows
-        })
-    
     # Export all tabs (tabs created only at export time)
     export_multiple_tables(client, exports)
+    
+    # Apply one-time formatting (only runs once per spreadsheet)
+    format_master_tabs_once(client)
+    
     logger.info(f"MASTER_EXPORT_COMPLETE | job_id={job_id} | tabs={len(exports)}")
 
 

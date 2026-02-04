@@ -45,7 +45,7 @@ def get_connection(dsn: Optional[str] = None) -> Connection:
         raise DatabaseConnectionError("No PostgreSQL DSN provided")
     
     try:
-        conn = psycopg.connect(dsn)
+        conn = psycopg.connect(dsn, autocommit=True)
         # Test the connection
         with conn.cursor() as cur:
             cur.execute("SELECT 1")

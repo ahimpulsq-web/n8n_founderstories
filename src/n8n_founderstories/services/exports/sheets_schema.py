@@ -7,23 +7,11 @@ This module defines the single source of truth for:
 - Schema versioning to prevent drift
 
 All exporters MUST use these constants to ensure consistency.
+
+Note: Tool_Status schema has been moved to services.jobs.sheets_spec
 """
 
 from __future__ import annotations
-
-# =============================================================================
-# STATUS TAB (Exception: created at runtime for live progress updates)
-# =============================================================================
-
-TAB_STATUS = "Tool_Status"
-
-HEADERS_STATUS = [
-    "Tool",
-    "State",
-    "Progress",
-    "Request ID",
-    "Job ID",
-]
 
 # =============================================================================
 # GOOGLE MAPS TABS (v2 - created only at export time)
@@ -99,6 +87,24 @@ HEADERS_HUNTER_AUDIT = [
 ]
 
 # =============================================================================
+# WEB ENRICHMENT TABS (legacy - for append-only sync)
+# =============================================================================
+
+TAB_WEB_ENRICHMENT_MAIN = "WebEnrichment"
+
+HEADERS_WEB_ENRICHMENT_MAIN = [
+    "master_result_id",
+    "Organisation",
+    "Domain",
+    "Source",
+    "Company Name",
+    "E-Mail ID",
+    "Contact Name",
+    "Company Description",
+    "Extraction Status",
+]
+
+# =============================================================================
 # MASTER TABS (v2 - created only at export time)
 # =============================================================================
 
@@ -106,14 +112,37 @@ TAB_MASTER_MAIN = "Master_v2"
 TAB_MASTER_AUDIT = "Master_Audit_v2"
 
 HEADERS_MASTER_MAIN = [
-    "master_result_id",
-    "Organisation",
-    "Domain",
-    "Source",
-    "Emails",
-    "Contacts",
-    "Extraction Status",
-    "Debug Message",
+    "master_result_id",                # Column 0 (A) - Row key for matching
+    "Organisation",                    # Column 1 (B) - Master field
+    "Domain",                          # Column 2 (C) - Master field
+    "Source",                          # Column 3 (D) - Master field
+    "Company Name",                    # Column 4 (E) - Web enrichment
+    "E-mail ID",                       # Column 5 (F) - Web enrichment
+    "Contact Names",                   # Column 6 (G) - Web enrichment
+    "Short Company Description",       # Column 7 (H) - Web enrichment
+    "Long Company Description",        # Column 8 (I) - Web enrichment
+]
+
+# =============================================================================
+# MAIL CONTENT TAB (v2 - created only at export time)
+# =============================================================================
+
+TAB_MAIL_CONTENT = "Mail_Content_v2"
+
+HEADERS_MAIL_CONTENT = [
+    "master_result_id",                # Column 0 (A) - Row key for matching (hidden)
+    "Organisation",                    # Column 1 (B) - From Master
+    "Domain",                          # Column 2 (C) - From Master
+    "Company Name",                    # Column 3 (D) - From combine (highest confidence)
+    "E-mail ID",                       # Column 4 (E) - From combine (highest confidence, single)
+    "Test Recipient",                  # Column 4 (E) - From combine (highest confidence, single)
+    "Contact Names",                   # Column 5 (F) - From combine (all with roles)
+    "Subject",                         # Column 6 (G) - Empty for now
+    "Content",                         # Column 7 (H) - Empty for now
+    "Mail Status",                     # Column 8 (H) - Empty for now
+    "Send Status",                     # Column 9 (H) - Empty for now
+    "Notes",                           # Column 10 (H) - Empty for now
+
 ]
 
 HEADERS_MASTER_AUDIT = [
@@ -157,17 +186,20 @@ TOOL_TAB_MAP = {
         "main": TAB_MASTER_MAIN,
         "audit": TAB_MASTER_AUDIT,
     },
+    "mail_content": {
+        "main": TAB_MAIL_CONTENT,
+    },
 }
 
 # Map of tab names to their headers
 TAB_HEADERS_MAP = {
-    TAB_STATUS: HEADERS_STATUS,
     TAB_GOOGLE_MAPS_MAIN: HEADERS_GOOGLE_MAPS_MAIN,
     TAB_GOOGLE_MAPS_AUDIT: HEADERS_GOOGLE_MAPS_AUDIT,
     TAB_HUNTER_MAIN: HEADERS_HUNTER_MAIN,
     TAB_HUNTER_AUDIT: HEADERS_HUNTER_AUDIT,
     TAB_MASTER_MAIN: HEADERS_MASTER_MAIN,
     TAB_MASTER_AUDIT: HEADERS_MASTER_AUDIT,
+    TAB_MAIL_CONTENT: HEADERS_MAIL_CONTENT,
 }
 
 
@@ -208,9 +240,6 @@ def get_tab_headers(tab_name: str) -> list[str]:
 
 
 __all__ = [
-    # Status tab (runtime exception)
-    "TAB_STATUS",
-    "HEADERS_STATUS",
     # Google Maps tabs (export-time only)
     "TAB_GOOGLE_MAPS_MAIN",
     "TAB_GOOGLE_MAPS_AUDIT",
@@ -226,6 +255,9 @@ __all__ = [
     "TAB_MASTER_AUDIT",
     "HEADERS_MASTER_MAIN",
     "HEADERS_MASTER_AUDIT",
+    # Mail Content tab (export-time only)
+    "TAB_MAIL_CONTENT",
+    "HEADERS_MAIL_CONTENT",
     # Legacy tabs (read-only)
     "LEGACY_TABS",
     # Schema metadata

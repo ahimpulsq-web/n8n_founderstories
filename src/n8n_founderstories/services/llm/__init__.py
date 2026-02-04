@@ -1,3 +1,4 @@
-# src/n8n_founderstories/services/llm/__init__.py
+"""LLM service interface module."""
+from .interface import LLMClient
 
-from .base import LLMClient, get_llm_client  # noqa: F401
+__all__ = ["LLMClient"]

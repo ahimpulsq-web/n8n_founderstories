@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
@@ -11,10 +12,11 @@ from pydantic import BaseModel, Field
 
 from ...core.utils.text import norm
 from ...core.errors import require_field
-from ...services.jobs.store import create_job
+from ...services.jobs import create_job, JobsSheetWriter
 from ...services.search_plan import SearchPlan
 from ...services.master_data.runner import run_master_job_db_first
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -103,6 +105,22 @@ async def start_master_job(payload: MasterJobRequest, background_tasks: Backgrou
             "db_first": True,  # Flag to indicate DB-first architecture
         },
     )
+
+    # CRITICAL: Write initial RUNNING row to Tool_Status IMMEDIATELY
+    # This ensures the sheet exists and shows the job before background work starts
+    if sid:
+        try:
+            status_writer = JobsSheetWriter(sheet_id=sid)
+            status_writer.write(
+                job_id=job_id,
+                tool="master",
+                request_id=rid,
+                state="RUNNING",
+                current=0,
+                total=0,
+            )
+        except Exception as e:
+            logger.warning("Failed to write initial Tool_Status row: %s", e)
 
     background_tasks.add_task(
         run_master_job_db_first,

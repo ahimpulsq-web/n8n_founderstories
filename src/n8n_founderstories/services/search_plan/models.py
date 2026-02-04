@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Literal, Optional, TypedDict
+from typing import Literal, Optional
+from typing_extensions import TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,31 @@ class GeoBucket(TypedDict):
 
     hl: str
     locations: list[str]
+
+
+class GeoBucketLLM(BaseModel):
+    """
+    LLM-owned geo bucket for structured output.
+    
+    Used in ResolvedGeoLLM for LLM-based geo resolution.
+    """
+    hl: str = Field(..., description="Language/locale hint for downstream search, e.g. de, en.")
+    locations: list[str] = Field(default_factory=list, description="Location phrases for query routing/bias.")
+
+
+class ResolvedGeoLLM(BaseModel):
+    """
+    LLM-based geo resolution result.
+    
+    This model is used when geo resolution is performed by the LLM instead of
+    deterministic rules. It provides structured geo intent extraction from user prompts.
+    """
+    resolved_geo: str = Field(..., description="High-level geo scope label. Example: DACH, Germany, Europe, Global.")
+    geo_mode: Literal["global", "region", "country", "city"] = Field(..., description="One of: global, region, country, city.")
+    geo_location_keywords: dict[str, GeoBucketLLM] = Field(
+        default_factory=dict,
+        description="ISO2 -> {hl, locations}. Example: DE/AT/CH buckets.",
+    )
 
 
 class SearchPlanPayload(BaseModel):
@@ -79,6 +105,12 @@ class SearchPlanMeta(BaseModel):
     raw_prompt: str
     request_id: Optional[str] = None
     provider_name: str
+    
+    # System-owned fields from prompt cleaning step
+    target_search: str
+    target_search_en: str
+    prompt_language: str
+    location: Optional[str] = None
 
 
 class SearchPlan(SearchPlanPayload, SearchPlanMeta):
@@ -91,3 +123,14 @@ class SearchPlan(SearchPlanPayload, SearchPlanMeta):
     """
 
     pass
+
+class CleanPromptPayloadLLM(BaseModel):
+    """
+    LLM output for prompt cleaning step.
+    
+    Extracts clean intent, language, and optional location from raw user prompt.
+    """
+    target_search: str = Field(..., description="What the user intends to search (cleaned, corrected, concise). No location. Same language as prompt_language.")
+    target_search_en: str = Field(..., description="English translation of target_search. If already English, repeat unchanged.")
+    prompt_language: str = Field(..., description="Detected language code (e.g. de, en, tr, fr).")
+    location: str | None = Field(None, description="Location mentioned by user, if any. Otherwise null.")

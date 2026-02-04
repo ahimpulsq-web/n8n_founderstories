@@ -1,16 +1,14 @@
 """
 Exports package.
-
-Classification:
-- Role: shared output sinks (e.g., Google Sheets) used across all tools.
+Shared output sinks (e.g., Google Sheets).
 """
 
 from .sheets import SheetsClient, SheetsConfig, default_sheets_config
-from .enrichment_sheets_sync import sync_enrichment_to_sheets
+from .sheets_exporter import export_master_results
 
 __all__ = [
     "SheetsClient",
     "SheetsConfig",
     "default_sheets_config",
-    "sync_enrichment_to_sheets",
+    "export_master_results",
 ]

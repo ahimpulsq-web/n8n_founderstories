@@ -92,8 +92,9 @@ def _ensure_dir(path: Path) -> None:
     """
     try:
         path.mkdir(parents=True, exist_ok=True)
+        logger.debug("STORAGE_DIR_CREATED | path=%s", path)
     except Exception as exc:
-        logger.warning("STORAGE_DIR_ERROR | path=%s | error=%s", path, exc)
+        logger.error("STORAGE_DIR_ERROR | path=%s | error=%s", path, exc, exc_info=True)
 
 
 def _normalize_provider(provider: str | None) -> str:
@@ -280,13 +281,18 @@ def save_artifact(
     raw_prompt: str | None = None,
     write_latest: bool = True,
     update_manifest: bool = True,
+    flat_structure: bool = False,
 ) -> Path | None:
     """
     Save an artifact with a consistent structure.
 
-    Layout:
+    Layout (default):
       data/<category>/<provider>/<kind>/<request_id>.json
       data/<category>/<provider>/<kind>/latest.json  (full copy of latest payload)
+
+    Layout (flat_structure=True):
+      data/<category>/<provider>/<request_id>.json
+      data/<category>/<provider>/latest.json
 
     Manifest:
       data/runs/<request_id>/manifest.json
@@ -294,6 +300,7 @@ def save_artifact(
     Notes:
     - request_id is the only filename (deterministic).
     - latest.json is a full payload copy (no pointer indirection).
+    - flat_structure skips the kind subdirectory level
     """
     request_id = str(request_id or "").strip()
     if not request_id:
@@ -301,16 +308,35 @@ def save_artifact(
         return None
 
     category_slug = slugify(category or "artifact") or "artifact"
-    provider_slug = _normalize_provider(provider)
+    provider_slug = _normalize_provider(provider) if not flat_structure else slugify(provider or "unknown") or "unknown"
     kind_slug = _normalize_kind(kind, default="result")
 
-    target_dir = BASE_DATA_DIR / category_slug / provider_slug / kind_slug
+    logger.info(
+        "ARTIFACT_SAVE_START | category=%s | provider_raw=%s | provider_normalized=%s | kind=%s | request_id=%s | flat=%s",
+        category_slug,
+        provider,
+        provider_slug,
+        kind_slug,
+        request_id,
+        flat_structure,
+    )
+
+    # Build target directory based on structure type
+    if flat_structure:
+        target_dir = BASE_DATA_DIR / category_slug / provider_slug
+    else:
+        target_dir = BASE_DATA_DIR / category_slug / provider_slug / kind_slug
+    
     _ensure_dir(target_dir)
 
     file_path = target_dir / f"{request_id}.json"
+    
+    logger.info("ARTIFACT_PATH | target_dir=%s | file_path=%s", target_dir, file_path)
 
     try:
+        logger.info("ARTIFACT_SERIALIZING | request_id=%s", request_id)
         serializable = _to_serializable(payload)
+        logger.info("ARTIFACT_SERIALIZED | request_id=%s | type=%s", request_id, type(serializable).__name__)
 
         # Ensure dict payload so we can enrich consistently.
         if isinstance(serializable, dict):
@@ -327,9 +353,11 @@ def save_artifact(
             }
 
         # Primary artifact write (critical)
+        logger.info("ARTIFACT_WRITING | file_path=%s", file_path)
         _atomic_write_json(file_path, serializable)
+        logger.info("ARTIFACT_WRITTEN | file_path=%s", file_path)
 
-        logger.debug(
+        logger.info(
             "ARTIFACT_SAVED | category=%s | provider=%s | kind=%s | request_id=%s | path=%s",
             category_slug,
             provider_slug,
@@ -366,14 +394,16 @@ def save_artifact(
         return file_path
 
     except Exception as exc:
-        logger.warning(
-            "ARTIFACT_SAVE_ERROR | category=%s | provider=%s | kind=%s | request_id=%s | path=%s | error=%s",
+        logger.error(
+            "ARTIFACT_SAVE_ERROR | category=%s | provider_raw=%s | provider_normalized=%s | kind=%s | request_id=%s | path=%s | error=%s",
             category_slug,
+            provider,
             provider_slug,
             kind_slug,
             request_id,
             file_path,
             exc,
+            exc_info=True,
         )
         return None
 
@@ -386,8 +416,11 @@ def save_search_plan_output(*, provider: str, request_id: str, payload: Any) -> 
     """
     Canonical SearchPlan persistence (single source of truth).
 
-    data/search_plan/<provider>/plan/<request_id>.json
-    data/search_plan/<provider>/plan/latest.json
+    New structure: data/search_plan/<model_name>/<request_id>.json
+    
+    The provider string is expected to be in format "provider/model_name"
+    (e.g., "openrouter/qwen/qwen-2-7b-instruct:free")
+    We extract just the model_name to create: search_plan/<model_name>/<file>
     """
     raw_prompt = None
     try:
@@ -395,15 +428,26 @@ def save_search_plan_output(*, provider: str, request_id: str, payload: Any) -> 
     except Exception:
         raw_prompt = None
 
+    # Extract model name from provider string
+    # "openrouter/qwen/qwen-2-7b-instruct:free" -> "qwen/qwen-2-7b-instruct:free"
+    model_name = provider
+    if "/" in provider:
+        parts = provider.split("/", 1)
+        if len(parts) > 1:
+            model_name = parts[1]  # Everything after first "/"
+    
+    # Use flat_structure=True to skip the kind subdirectory
+    # This creates: search_plan/<model_name>/<request_id>.json
     return save_artifact(
         category=CATEGORY_SEARCH_PLAN,
-        provider=provider,
-        kind="plan",
+        provider=model_name,
+        kind="plan",  # Not used when flat_structure=True, but kept for manifest
         request_id=request_id,
         payload=payload,
         raw_prompt=raw_prompt,
         write_latest=True,
         update_manifest=True,
+        flat_structure=True,
     )
 
 

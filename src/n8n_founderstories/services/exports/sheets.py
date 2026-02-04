@@ -1,3 +1,30 @@
+"""
+DEPRECATED: Legacy Google Sheets client.
+
+This module is deprecated and will be removed in a future version.
+Please use the new exportsv2 module instead:
+
+- For simple writes: Use exportsv2.writer.write_rows()
+- For formatted writes: Use exportsv2.base_writer.BaseSheetWriter
+- For formatting: Use exportsv2.formatting module
+
+Migration guide:
+1. Create a sheets_spec.py in your service with TAB_NAME, HEADERS, and formatting config
+2. For data fetching, create a data_fetcher.py separate from sheets_spec.py
+3. Use exportsv2.writer.write_rows() for simple append/replace operations
+4. Use exportsv2.base_writer.BaseSheetWriter for complex formatting needs
+
+Example migration:
+    # Old way (deprecated):
+    from n8n_founderstories.services.exports.sheets import SheetsClient
+    client = SheetsClient(config=config)
+    client.write_range(...)
+    
+    # New way:
+    from n8n_founderstories.exportsv2.writer import write_rows
+    write_rows(sheet_id=..., tab_name=..., headers=..., rows=..., mode="append")
+"""
+
 from __future__ import annotations
 
 import logging
@@ -145,9 +172,17 @@ def _parse_row_from_updated_range(updated_range: str) -> int | None:
 
 
 class SheetsClient:
+    """
+    DEPRECATED: Use exportsv2 module instead.
+    
+    This class is maintained for backward compatibility only.
+    """
     _A1_RE = re.compile(r"^([A-Za-z]+)(\d+)?$")
 
     def __init__(self, *, config: SheetsConfig) -> None:
+        logger.warning(
+            "DEPRECATED: SheetsClient is deprecated. Use exportsv2.writer or exportsv2.base_writer instead."
+        )
         self._spreadsheet_id = norm(config.spreadsheet_id)
         if not self._spreadsheet_id:
             raise ValueError("spreadsheet_id must not be empty.")
