@@ -158,8 +158,8 @@ class LiveStatusLogger:
             parts.append(f"{current}/{total}")
 
         priority_keys = [
-            "completed_total", "loc", "headcount", "kw", "query", "page",
-            "results", "domains", "found", "status", "wait_s", "attempt"
+            "completed_total", "location", "locations", "loc", "headcount", "kw", "query", "page",
+            "results", "domains", "found", "status", "wait_s", "wait_left_s", "attempt", "http_status"
         ]
         for key in priority_keys:
             if key in fields and fields[key] is not None:
