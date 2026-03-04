@@ -1,18 +1,19 @@
-"""
-Search plan package.
+from __future__ import annotations
 
-Public API:
-- build_search_plan(...)
-- SearchPlan (and related models)
-"""
+# ============================================================================
+# search_plan package
+#
+# Public API:
+# - interpret_prompt: Main entry point for prompt interpretation
+# - PromptInterpretation: Result model
+# - ResolvedLocation: Location model with geo metadata
+# ============================================================================
 
-from .builder import build_search_plan
-from .models import SearchPlan, SearchPlanMeta, SearchPlanPayload, SearchPlanPayloadLLM
+from .service import interpret_prompt
+from .models import PromptInterpretation, ResolvedLocation
 
 __all__ = [
-    "build_search_plan",
-    "SearchPlan",
-    "SearchPlanMeta",
-    "SearchPlanPayload",
-    "SearchPlanPayloadLLM",
+    "interpret_prompt",
+    "PromptInterpretation",
+    "ResolvedLocation",
 ]
