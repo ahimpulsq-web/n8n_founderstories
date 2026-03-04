@@ -1,99 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
 venv/
-__pycache__/
-*.pyc
-
-
-# Secrets
-.env
-*.env
-*.json
-
-# Artifacts and Runtime/protype folder
-data/
-/email_finder_prototype
-
-# Personal reference
-commands.txt
-Improvements.txt
-ToDO.txt
-
-# Python build artifacts
-*.egg-info/
-dist/
-build/
-__pycache__/
-*.pyc
-
-# =========================
-# OS / IDE
-# =========================
-Thumbs.db
-Desktop.ini
-$RECYCLE.BIN/
-*.lnk
-.DS_Store
-.idea/
-.vscode/
-!.vscode/extensions.json
-!.vscode/settings.json
-!.vscode/launch.json
-!.vscode/tasks.json
-*.swp
-*.swo
-
-# =========================
-# Python tooling / caches
-# =========================
-.pytest_cache/
-.mypy_cache/
-.pytype/
-.pyre/
-.ruff_cache/
-.hypothesis/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
-
-# =========================
-# Virtualenvs
-# =========================
 .venv/
 env/
 ENV/
 venv.bak/
 
-# =========================
-# Build / packaging
-# =========================
-*.whl
-pip-wheel-metadata/
+# Environment variables
+.env
+.env.*
+!.env.example
 
-# =========================
-# Logs / dumps
-# =========================
-*.log
-logs/
-*.out
-*.dump
-*.sql.gz
-*.tar
-*.bak
-domains.txt
-output/
-
-# =========================
-# Repo-specific generated artifacts
-# =========================
-code-map.html
-src.zip
-psql/
-test_results/
-n8n-*.json
-
-# =========================
-# Credentials / keys
-# =========================
+# Credentials & secrets
+*.json
+!package.json
+!tsconfig.json
 *.pem
 *.key
 *.p12
@@ -105,66 +32,48 @@ credentials.json
 client_secret*.json
 token.json
 
-# Optional: ignore most root-level design notes (keep docs/ instead)
-*_SUMMARY.md
-*_IMPLEMENTATION*.md
-DB_FIRST_*.md
-MASTER_*.md
-GOOGLE_MAPS_*.md
-SHEETS_*.md
-REFACTORING_SUMMARY.md
-IMPLEMENTATION_SUMMARY.md
-TOOL_STATUS_FIX_SUMMARY.md
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
 
+# Python build artifacts
+*.egg-info/
+dist/
+build/
+*.whl
+pip-wheel-metadata/
 
-# Local tooling / scratch
-psql/
-FROM
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+test_results/
+*.log
 
-# Ad-hoc local tests at repo root
-test_domains.txt
-test_env_loading.py
-test_multiple_domains.py
-psql/
+# Logs
+logs/
+*.log
+*.out
 
-
-# =========================
-# Temporary cleanup / local-only
-# =========================
-
-CODE_MAP_GUIDE.md
-docs/
-psql/
-scripts/
-
-# Examples / refactors
-src/n8n_founderstories/services/outreach/hunterio/runner_refactored_example.py
-
-# Tests (temporary ignore – re-enable later)
-tests/
-
-
-# Local experiments / prototypes
-crawlaitest/
-email_finder_prototype/
-company_data_extractor/   # root-level accidental copies
-src (7).zip
-
-# Local design / refactor notes (use docs/ instead)
-ENRICHMENT_REFACTORING.md
-*_REFACTORING.md
-*_SUMMARY.md
-*_IMPLEMENTATION*.md
-
-
-# Accidental archives
-*.zip
+# Temporary files
+*.tmp
+*.bak
+*.dump
+*.sql.gz
 *.tar
 *.tar.gz
+*.zip
 
-# AI / crawler test artifacts
-crawl4ai/
-crawl4ai_test/
-
-# Local dispatch / scratch scripts
-src/n8n_founderstories/services/_dispatch_*.py
+# Project-specific
+data/
+output/
+psql/
+credentials/
+crawl4ai-profile/
+*.backup
+.env.backup

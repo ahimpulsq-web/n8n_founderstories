@@ -1,62 +1,65 @@
+# =============================================================================
+# N8N-FounderStories Production Dependencies
+# =============================================================================
+
+# =============================================================================
+# Core Web Framework
+# =============================================================================
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
 python-dotenv
-requests
-httpx
-tldextract
-pycountry
-pytest
-geopy
-spacy
+
+# =============================================================================
+# HTTP Clients & Networking
+# =============================================================================
+requests>=2.0.0
+httpx[http2]
 aiohttp
-lxml
-pandas
-tqdm
+
+# =============================================================================
+# Database & ORM
+# =============================================================================
+psycopg[binary]
+
+# =============================================================================
+# Web Scraping & Crawling
+# =============================================================================
+crawl4ai
 playwright
 trafilatura
-extruct
-w3lib
 lxml
-email-validator
-tldextract
-httpx[http2]
-scrapy
-sqlalchemy 
-psycopg[binary]
-pytest-asyncio
 
+# =============================================================================
+# LLM & AI Services
+# =============================================================================
 openai
-google-genai
-groq
-trafilatura
 
-pyhunter
-rapidfuzz 
-beautifulsoup4
+# =============================================================================
+# NLP & Text Processing
+# =============================================================================
 spacy>=3.0.0
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
-requests>=2.0.0
+rapidfuzz
+regex
 
+# =============================================================================
+# Domain & Email Utilities
+# =============================================================================
+tldextract
+email-validator
+
+# =============================================================================
+# Google Services Integration
+# =============================================================================
 google-api-python-client
-google-auth 
+google-auth
 google-auth-httplib2
 google-auth-oauthlib
 
-crawl4ai
-playwright
-
-
-selectolax
-flair 
-rapidfuzz 
-regex
-
-probablepeople
-thefuzz
-PyPDF2
-pdfplumber
-pytesseract 
-pdf2image 
-pillow
+# =============================================================================
+# Testing
+# =============================================================================
+pytest
+pytest-asyncio
