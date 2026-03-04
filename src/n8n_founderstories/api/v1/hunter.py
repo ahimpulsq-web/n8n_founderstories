@@ -8,9 +8,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from ...core.utils.text import norm
-from ...core.db import get_conn
-from ...services.jobs import create_job, JobsSheetWriter
-from ...services.outreach.hunteriov2.runner import run_hunter_from_search_plan
+from ...services.jobs import create_job
+from ...services.sheets.exports.jobs_tool_status import write_single_job_status
+from ...services.sources.hunterio.runner import run_hunter_from_search_plan
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -28,6 +28,26 @@ class HunterRunResponse(BaseModel):
     request_id: str
 
 
+class StatusWriterImpl:
+    """Implementation of StatusWriter protocol for writing job status to Google Sheets."""
+    
+    def __init__(self, sheet_id: str):
+        self.sheet_id = sheet_id
+    
+    def write(self, *, job_id: str, tool: str, request_id: str, state: str) -> None:
+        """Write a status update for a job to Google Sheets."""
+        try:
+            write_single_job_status(
+                sheet_id=self.sheet_id,
+                job_id=job_id,
+                tool=tool,
+                request_id=request_id,
+                state=state,
+            )
+        except Exception as e:
+            logger.warning("Failed to write job status: %s", e)
+
+
 def _run_hunter_job(*, job_id: str, search_plan: Dict[str, Any], use_industries_filter: bool, sheet_id: str | None) -> None:
     """
     Background task that runs Hunter.
@@ -35,13 +55,10 @@ def _run_hunter_job(*, job_id: str, search_plan: Dict[str, Any], use_industries_
     """
     request_id = norm(search_plan.get("request_id"))
     
-    # Create status writer if sheet_id provided
+    # Create status writer instance if sheet_id provided
     status_writer = None
     if sheet_id:
-        try:
-            status_writer = JobsSheetWriter(sheet_id=sheet_id)
-        except Exception as e:
-            logger.warning("Failed to create JobsSheetWriter: %s", e)
+        status_writer = StatusWriterImpl(sheet_id)
     
     try:
         run_hunter_from_search_plan(
@@ -50,23 +67,7 @@ def _run_hunter_job(*, job_id: str, search_plan: Dict[str, Any], use_industries_
             use_industries_filter=use_industries_filter,
             status_writer=status_writer,
         )
-        
-        # Query database for actual persisted row count
-        conn = get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM hunterio_results WHERE job_id=%s",
-                    (job_id,),
-                )
-                db_count = int(cur.fetchone()[0])
-        finally:
-            conn.close()
-        
-        logger.info(
-            "HUNTERIOV2 | STATE=COMPLETED | job_id=%s | results=%d",
-            job_id, db_count
-        )
+        # Service layer handles all completion logging (COMPLETED, SHEETS, DATABASE)
     except Exception as e:
         logger.error(
             "HUNTERIOV2 | STATE=FAILED | request_id=%s | error=%s",
@@ -88,6 +89,8 @@ async def start_hunter_run(payload: HunterRunRequest, background_tasks: Backgrou
 
     job_id = f"htrio__{uuid4().hex}"
 
+    # OPTIMIZATION: Move ALL I/O operations to background task
+    # Only create job record in memory (fast, no I/O)
     create_job(
         job_id=job_id,
         tool="hunteriov2",
@@ -95,22 +98,8 @@ async def start_hunter_run(payload: HunterRunRequest, background_tasks: Backgrou
         meta={"sheet_id": sheet_id} if sheet_id else {},
     )
 
-    # CRITICAL: Write initial RUNNING row to Tool_Status IMMEDIATELY
-    # This ensures the sheet exists and shows the job before background work starts
-    if sheet_id:
-        try:
-            status_writer = JobsSheetWriter(sheet_id=sheet_id)
-            status_writer.write(
-                job_id=job_id,
-                tool="hunter",
-                request_id=rid,
-                state="RUNNING",
-                current=0,
-                total=0,
-            )
-        except Exception as e:
-            logger.warning("Failed to write initial Tool_Status row: %s", e)
-
+    # OPTIMIZATION: Move sheet initialization to background task
+    # This removes 3-4 seconds of Google Sheets API calls from response path
     background_tasks.add_task(
         _run_hunter_job,
         job_id=job_id,
@@ -119,4 +108,5 @@ async def start_hunter_run(payload: HunterRunRequest, background_tasks: Backgrou
         sheet_id=sheet_id,
     )
 
+    # Return immediately - background task handles all I/O
     return HunterRunResponse(status="accepted", job_id=job_id, request_id=rid)

@@ -18,8 +18,8 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from ...core.utils.text import norm
-from ...services.llm_searchplan.service import interpret_prompt
-from ...services.llm_searchplan.models import PromptInterpretation
+from ...services.search_plan.service import interpret_prompt
+from ...services.search_plan.models import PromptInterpretation
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

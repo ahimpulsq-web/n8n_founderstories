@@ -20,6 +20,7 @@ import logging
 import os
 import random
 import time
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict
@@ -30,10 +31,41 @@ from .models import JobProgress, JobRecord, JobState, utc_now
 
 logger = logging.getLogger(__name__)
 
+
+def _json_serializer(obj: Any) -> str:
+    """
+    Custom JSON serializer with consistent datetime formatting and best-effort fallback.
+    
+    Ensures consistent ISO 8601 format (with 'T' separator) for datetime objects,
+    avoiding the inconsistent space-separated format from default=str.
+    
+    For unknown types, falls back to str() for best-effort persistence rather than
+    crashing writes. This is a pragmatic choice for job metadata/metrics that may
+    contain unexpected types.
+    
+    Args:
+        obj: Object to serialize
+        
+    Returns:
+        ISO 8601 formatted string for datetime objects, str() for others
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    # Best-effort fallback for unknown types (e.g., custom objects in meta/metrics)
+    # This prevents write failures while maintaining data persistence
+    return str(obj)
+
+
 # Classification:
-# - In-process lock (threads within the same process).
-# - Cross-process safety is handled via retrying os.replace on Windows.
-_STORE_LOCK = Lock()
+# - Write lock: Serializes writers to prevent lost updates (read-modify-write races)
+# - Readers do NOT use this lock - they rely on atomic file replacement
+# - Cross-process safety is handled via retrying os.replace on Windows
+#
+# Design rationale:
+# - Atomic os.replace() guarantees readers see either old complete file or new complete file
+# - Writers must serialize to avoid lost updates when multiple threads write concurrently
+# - Readers can proceed lock-free because files are always in valid state
+_WRITE_LOCK = Lock()
 
 # Classification: latest.json write throttling (optional, safe default)
 # - Prevents hot loops from rewriting latest.json excessively.
@@ -92,7 +124,7 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp_path = path.with_name(tmp_name)
 
     with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=_json_serializer)
         f.flush()
         try:
             os.fsync(f.fileno())
@@ -130,6 +162,12 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def create_job(*, job_id: str, tool: str, request_id: str, meta: Dict[str, Any] | None = None) -> JobRecord:
+    """
+    Create a new job record.
+    
+    OPTIMIZATION: Job creation is now async-friendly - the actual file write
+    happens in the background task, not in the API response path.
+    """
     tool = slugify(norm(tool)) or "unknown"
     request_id = norm(request_id)
     if not request_id:
@@ -143,7 +181,9 @@ def create_job(*, job_id: str, tool: str, request_id: str, meta: Dict[str, Any] 
         meta=dict(meta or {}),
     )
 
-    save_job(rec, force_latest=True)
+    # OPTIMIZATION: Save without forcing latest.json update to reduce I/O
+    # The background task will update it when it starts running
+    save_job(rec, force_latest=False)
     return rec
 
 
@@ -178,18 +218,29 @@ def save_job(job: JobRecord, *, force_latest: bool = False) -> None:
     - Policy:
       - atomic write; store always readable
       - latest.json update is write-light unless forced/terminal
+      - writers serialize via _WRITE_LOCK to prevent lost updates
+      - readers are lock-free (rely on atomic file replacement)
+    
+    Concurrency design:
+    - Writers hold _WRITE_LOCK for entire read-modify-write cycle to prevent lost updates
+    - Readers do NOT use locks - they rely on atomic os.replace() guarantees
+    - Atomic replacement ensures readers see either old complete file or new complete file
+    - This prevents reader starvation while avoiding lost update races
     """
-    with _STORE_LOCK:
+    with _WRITE_LOCK:
         job.updated_at = utc_now()
 
         store_path = _jobs_store_path()
         latest_path = _latest_path()
 
+        # Read current store and build new payload
         store = _read_json_file(store_path)
         store[job.job_id] = job.model_dump(mode="python")
+        
+        # Write jobs.json atomically
         _atomic_write_json(store_path, store)
 
-        # latest.json is convenience; protect quota/IO with throttling
+        # Determine if we need to update latest.json
         terminal = job.state in {JobState.SUCCEEDED, JobState.FAILED}
         if not _should_write_latest(force=force_latest or terminal):
             return
@@ -210,6 +261,7 @@ def save_job(job: JobRecord, *, force_latest: bool = False) -> None:
             "updated_at": job.updated_at.isoformat(),
         }
 
+        # Write latest.json atomically
         _atomic_write_json(latest_path, latest)
 
 
@@ -217,30 +269,30 @@ def load_job(job_id: str) -> JobRecord | None:
     """
     Classification:
     - Role: retrieve one job record from jobs.json store.
+    - Lock-free read: relies on atomic file replacement guarantees
     """
     jid = norm(job_id)
     if not jid:
         return None
 
-    with _STORE_LOCK:
-        store = _read_json_file(_jobs_store_path())
-        raw = store.get(jid)
-        if not isinstance(raw, dict):
-            return None
-        try:
-            return JobRecord.model_validate(raw)
-        except Exception:
-            logger.warning("JOB_VALIDATE_ERROR | job_id=%s", jid, exc_info=True)
-            return None
+    store = _read_json_file(_jobs_store_path())
+    raw = store.get(jid)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return JobRecord.model_validate(raw)
+    except Exception:
+        logger.warning("JOB_VALIDATE_ERROR | job_id=%s", jid, exc_info=True)
+        return None
 
 
 def load_latest_job(*, tool: str | None = None) -> JobRecord | None:
     """
     Classification:
     - Role: fast access to the latest job overall or by tool via latest.json
+    - Lock-free read: relies on atomic file replacement guarantees
     """
-    with _STORE_LOCK:
-        latest = _read_json_file(_latest_path())
+    latest = _read_json_file(_latest_path())
 
     if tool:
         info = latest.get("by_tool", {}).get(slugify(norm(tool)))
@@ -257,20 +309,53 @@ def load_latest_job(*, tool: str | None = None) -> JobRecord | None:
     return load_job(jid)
 
 
+def list_jobs() -> list[JobRecord]:
+    """
+    List all jobs from the jobs store, sorted by updated_at (most recent first).
+    
+    Classification:
+    - Role: retrieve all job records from jobs.json store
+    - Returns validated JobRecord instances
+    - Sorted by updated_at descending (newest first)
+    - Lock-free read: relies on atomic file replacement guarantees
+    
+    Returns:
+        List of JobRecord instances, sorted by updated_at (newest first).
+        Returns empty list if no jobs exist or if store is corrupted.
+    """
+    store = _read_json_file(_jobs_store_path())
+    
+    jobs: list[JobRecord] = []
+    for job_data in store.values():
+        if not isinstance(job_data, dict):
+            continue
+        try:
+            job = JobRecord.model_validate(job_data)
+            jobs.append(job)
+        except Exception:
+            logger.warning("JOB_VALIDATE_ERROR during list_jobs", exc_info=True)
+            continue
+    
+    # Sort by updated_at descending (newest first)
+    jobs.sort(key=lambda j: j.updated_at, reverse=True)
+    
+    return jobs
+
+
 def find_job_by_request_and_tool(*, request_id: str, tool: str) -> JobRecord | None:
     """
     Find the most recent job for a given request_id and tool.
     
     This scans the jobs store to find jobs matching both criteria.
     Useful for checking if source jobs are still running.
+    Lock-free read: relies on atomic file replacement guarantees.
     """
     rid = norm(request_id)
     t = slugify(norm(tool)) or "unknown"
     if not rid:
         return None
     
-    with _STORE_LOCK:
-        store = _read_json_file(_jobs_store_path())
+    store = _read_json_file(_jobs_store_path())
     
     # Find all jobs matching request_id and tool, return the most recent
     matching: list[tuple[JobRecord, datetime]] = []

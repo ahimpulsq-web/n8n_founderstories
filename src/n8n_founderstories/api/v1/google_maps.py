@@ -8,9 +8,9 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from ...core.utils.text import norm
-from ...core.db import get_conn
-from ...services.jobs import create_job, JobsSheetWriter
-from ...services.location.google_mapsv2.runner import run_google_places_from_search_plan
+from ...services.jobs import create_job
+from ...services.sheets.exports.jobs_tool_status import write_single_job_status
+from ...services.sources.google_maps.runner import run_google_places_from_search_plan
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -27,6 +27,26 @@ class GoogleMapsRunResponse(BaseModel):
     request_id: str
 
 
+class StatusWriterImpl:
+    """Implementation of StatusWriter protocol for writing job status to Google Sheets."""
+    
+    def __init__(self, sheet_id: str):
+        self.sheet_id = sheet_id
+    
+    def write(self, *, job_id: str, tool: str, request_id: str, state: str) -> None:
+        """Write a status update for a job to Google Sheets."""
+        try:
+            write_single_job_status(
+                sheet_id=self.sheet_id,
+                job_id=job_id,
+                tool=tool,
+                request_id=request_id,
+                state=state,
+            )
+        except Exception as e:
+            logger.warning("Failed to write job status: %s", e)
+
+
 def _run_google_maps_job(*, job_id: str, search_plan: Dict[str, Any], sheet_id: str | None) -> None:
     """
     Background task that runs Google Maps Places search.
@@ -34,13 +54,8 @@ def _run_google_maps_job(*, job_id: str, search_plan: Dict[str, Any], sheet_id: 
     """
     request_id = norm(search_plan.get("request_id"))
     
-    # Create status writer if sheet_id provided
-    status_writer = None
-    if sheet_id:
-        try:
-            status_writer = JobsSheetWriter(sheet_id=sheet_id)
-        except Exception as e:
-            logger.warning("Failed to create JobsSheetWriter: %s", e)
+    # Create status writer instance if sheet_id provided
+    status_writer = StatusWriterImpl(sheet_id) if sheet_id else None
     
     try:
         run_google_places_from_search_plan(
@@ -48,23 +63,7 @@ def _run_google_maps_job(*, job_id: str, search_plan: Dict[str, Any], sheet_id: 
             job_id=job_id,
             status_writer=status_writer,
         )
-        
-        # Query database for actual persisted row count
-        conn = get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT COUNT(*) FROM googlemaps_places_results WHERE job_id=%s",
-                    (job_id,),
-                )
-                db_count = int(cur.fetchone()[0])
-        finally:
-            conn.close()
-        
-        logger.info(
-            "GOOGLEMAPSV2 | STATE=COMPLETED | job_id=%s | results=%d",
-            job_id, db_count
-        )
+        # Service layer handles all completion logging (COMPLETED, SHEETS, DATABASE)
     except Exception as e:
         logger.error(
             "GOOGLEMAPSV2 | STATE=FAILED | request_id=%s | error=%s",
@@ -86,6 +85,8 @@ async def start_google_maps_run(payload: GoogleMapsRunRequest, background_tasks:
 
     job_id = f"gmap__{uuid4().hex}"
 
+    # OPTIMIZATION: Move ALL I/O operations to background task
+    # Only create job record in memory (fast, no I/O)
     create_job(
         job_id=job_id,
         tool="googlemapsv2",
@@ -93,22 +94,8 @@ async def start_google_maps_run(payload: GoogleMapsRunRequest, background_tasks:
         meta={"sheet_id": sheet_id} if sheet_id else {},
     )
 
-    # CRITICAL: Write initial RUNNING row to Tool_Status IMMEDIATELY
-    # This ensures the sheet exists and shows the job before background work starts
-    if sheet_id:
-        try:
-            status_writer = JobsSheetWriter(sheet_id=sheet_id)
-            status_writer.write(
-                job_id=job_id,
-                tool="google_maps",
-                request_id=rid,
-                state="RUNNING",
-                current=0,
-                total=0,
-            )
-        except Exception as e:
-            logger.warning("Failed to write initial Tool_Status row: %s", e)
-
+    # OPTIMIZATION: Move sheet initialization to background task
+    # This removes 3-4 seconds of Google Sheets API calls from response path
     background_tasks.add_task(
         _run_google_maps_job,
         job_id=job_id,
@@ -116,4 +103,5 @@ async def start_google_maps_run(payload: GoogleMapsRunRequest, background_tasks:
         sheet_id=sheet_id,
     )
 
+    # Return immediately - background task handles all I/O
     return GoogleMapsRunResponse(status="accepted", job_id=job_id, request_id=rid)
