@@ -1,0 +1,129 @@
+# =============================================================================
+# N8N-FounderStories Docker Compose Configuration
+# =============================================================================
+# Production-ready setup with PostgreSQL database
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # ===========================================================================
+  # PostgreSQL Database
+  # ===========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: n8n-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:-n8n_founderstories}
+      POSTGRES_USER: ${POSTGRES_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - n8n-network
+
+  # ===========================================================================
+  # N8N-FounderStories Application
+  # ===========================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: n8n-founderstories
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Application
+      APP_NAME: ${APP_NAME:-N8N-FounderStories}
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      HOST: 0.0.0.0
+      PORT: 8000
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      
+      # Database (use service name as host)
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:-n8n_founderstories}
+      POSTGRES_USERNAME: ${POSTGRES_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      ENABLE_POSTGRES: true
+      
+      # LLM Provider
+      LLM_API_KEYS: ${LLM_API_KEYS:?LLM_API_KEYS is required}
+      LLM_PREMIUM_MODELS: ${LLM_PREMIUM_MODELS}
+      LLM_FREE_MODELS: ${LLM_FREE_MODELS}
+      
+      # External APIs
+      HUNTER_API_KEY: ${HUNTER_API_KEY}
+      GOOGLE_MAPS_API_KEY: ${GOOGLE_MAPS_API_KEY}
+      SERPAPI_API_KEY: ${SERPAPI_API_KEY}
+      
+      # Google Sheets
+      GOOGLE_SERVICE_ACCOUNT_FILE: /app/credentials/service-account.json
+      GLOBAL_MAIL_TRACKING_SHEET_ID: ${GLOBAL_MAIL_TRACKING_SHEET_ID}
+      
+      # Web Scraping
+      DOMAIN_CONCURRENCY: ${DOMAIN_CONCURRENCY:-4}
+      CRAWL4AI_MAX_CONCURRENCY: ${CRAWL4AI_MAX_CONCURRENCY:-3}
+      HEADLESS: ${HEADLESS:-true}
+    volumes:
+      # Mount credentials (read-only)
+      - ./credentials:/app/credentials:ro
+      # Persistent volumes for logs and browser profile
+      - app_logs:/app/logs
+      - crawl_profile:/app/crawl4ai-profile
+    ports:
+      - "${PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/v1/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - n8n-network
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  n8n-network:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  app_logs:
+    driver: local
+  crawl_profile:
+    driver: local
+
+# =============================================================================
+# Usage Instructions:
+# =============================================================================
+# 1. Copy .env.example to .env and configure all required variables
+# 2. Place Google service account JSON in ./credentials/service-account.json
+# 3. Start services:
+#    docker-compose up -d
+# 4. View logs:
+#    docker-compose logs -f app
+# 5. Stop services:
+#    docker-compose down
+# 6. Stop and remove volumes (WARNING: deletes all data):
+#    docker-compose down -v
+# =============================================================================

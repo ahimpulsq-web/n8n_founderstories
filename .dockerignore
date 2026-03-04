@@ -1,0 +1,100 @@
+# =============================================================================
+# Docker Ignore File
+# =============================================================================
+# Excludes unnecessary files from Docker build context
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+venv.bak/
+
+# Environment variables (use docker-compose env or --env-file)
+.env
+.env.*
+!.env.example
+
+# Credentials & secrets
+credentials/
+*.json
+!package.json
+!tsconfig.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+*.jks
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.whl
+pip-wheel-metadata/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+test_results/
+
+# Logs
+logs/
+*.log
+*.out
+
+# Temporary files
+*.tmp
+*.bak
+*.dump
+*.sql.gz
+*.tar
+*.tar.gz
+*.zip
+
+# Project-specific
+data/
+output/
+psql/
+crawl4ai-profile/
+*.backup
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation (not needed in runtime)
+*.md
+!README.md
+docs/
+
+# Docker files (not needed inside container)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
